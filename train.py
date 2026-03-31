@@ -141,45 +141,68 @@ def get_args():
     parser.add_argument('--dropout', type=float, default=0.2)
     return parser.parse_args()
 
-def calculate_metrics(pred, target, ctrl, n=50):
+def _safe_pearson(x, y):
+    if np.std(x) <= 1e-8 or np.std(y) <= 1e-8:
+        return np.nan
+    r, _ = pearsonr(x, y)
+    return r if not np.isnan(r) else np.nan
+
+def calculate_metrics(pred, target, ctrl):
     """
-    计算评估指标体系：
-    1. Global Pearson: 全谱相关性 (包含背景)
-    2. Delta Pearson: 变化量的相关性 (核心能力)
-    3. TopN Pearson: 仅针对真实变化最剧烈的 N 个基因的变化趋势拟合度
-    4. TopN Recall: 预测的变化 TopN 与真实变化 TopN 的重叠率
+    返回更完整的指标:
+    - 全谱: all_mse / all_pearson
+    - Delta: delta_pearson
+    - TopK (K=10/20/50): mse / pearson / recall
+    - all_de: 对所有非dropout(真实delta!=0)基因统计 mse / pearson
     """
-    global_rs, delta_rs, top_n_rs, top_n_recalls = [], [], [], []
-    
+    top_ks = [10, 20, 50]
+    collector = {
+        'all_mse': [],
+        'all_pearson': [],
+        'delta_pearson': [],
+        'all_de_mse': [],
+        'all_de_pearson': []
+    }
+    for k in top_ks:
+        collector[f'top{k}_mse'] = []
+        collector[f'top{k}_pearson'] = []
+        collector[f'top{k}_recall'] = []
+
     for i in range(pred.shape[0]):
         p, t, c = pred[i], target[i], ctrl[i]
         d_p = p - c
         d_t = t - c
-        
-        # 1. Global Pearson
-        r_g, _ = pearsonr(p, t)
-        if not np.isnan(r_g): global_rs.append(r_g)
-        
-        # 2. Delta Pearson
-        if np.std(d_p) > 1e-6 and np.std(d_t) > 1e-6:
-            r_d, _ = pearsonr(d_p, d_t)
-            if not np.isnan(r_d): delta_rs.append(r_d)
-            
-            # 3. TopN Pearson
-            top_indices = np.argsort(np.abs(d_t))[-n:] # 真实变化最大的 N 个基因
-            r_tn, _ = pearsonr(d_p[top_indices], d_t[top_indices])
-            if not np.isnan(r_tn): top_n_rs.append(r_tn)
-            
-            # 4. TopN Recall
-            pred_top_indices = np.argsort(np.abs(d_p))[-n:]
-            recall = len(set(top_indices) & set(pred_top_indices)) / n
-            top_n_recalls.append(recall)
-            
+
+        collector['all_mse'].append(float(np.mean((p - t) ** 2)))
+        r_all = _safe_pearson(p, t)
+        if not np.isnan(r_all):
+            collector['all_pearson'].append(r_all)
+
+        r_delta = _safe_pearson(d_p, d_t)
+        if not np.isnan(r_delta):
+            collector['delta_pearson'].append(r_delta)
+
+        non_dropout_mask = np.abs(d_t) > 1e-8
+        if np.any(non_dropout_mask):
+            collector['all_de_mse'].append(float(np.mean((d_p[non_dropout_mask] - d_t[non_dropout_mask]) ** 2)))
+            r_de = _safe_pearson(d_p[non_dropout_mask], d_t[non_dropout_mask])
+            if not np.isnan(r_de):
+                collector['all_de_pearson'].append(r_de)
+
+        for k in top_ks:
+            k_eff = min(k, len(d_t))
+            top_true = np.argsort(np.abs(d_t))[-k_eff:]
+            top_pred = np.argsort(np.abs(d_p))[-k_eff:]
+            collector[f'top{k}_mse'].append(float(np.mean((d_p[top_true] - d_t[top_true]) ** 2)))
+            r_top = _safe_pearson(d_p[top_true], d_t[top_true])
+            if not np.isnan(r_top):
+                collector[f'top{k}_pearson'].append(r_top)
+            collector[f'top{k}_recall'].append(float(len(set(top_true) & set(top_pred)) / max(k_eff, 1)))
+
+    # 聚合
     return {
-        'global_r': np.mean(global_rs) if global_rs else 0.0,
-        'delta_r': np.mean(delta_rs) if delta_rs else 0.0,
-        'top_n_r': np.mean(top_n_rs) if top_n_rs else 0.0,
-        'top_n_recall': np.mean(top_n_recalls) if top_n_recalls else 0.0
+        k: (float(np.mean(v)) if len(v) > 0 else 0.0)
+        for k, v in collector.items()
     }
 def train():
     args = get_args()
@@ -231,7 +254,6 @@ def train():
     control_id = processor.perturb_map.get('control', None)
     drug_embeddings = processor.drug_embeddings.to(device) if processor.drug_embeddings is not None else None
     ema = ExponentialMovingAverage(model, decay=args.ema_decay)
-
 
     # 4. 训练循环
     if not os.path.exists(args.save_dir): os.makedirs(args.save_dir)
@@ -349,22 +371,20 @@ def train():
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
         # 聚合所有 batch 的指标
-        final_m = {k: np.mean([m[k] for m in all_metrics]) for k in all_metrics[0].keys()} if all_metrics else {
-            'global_r': 0.0,
-            'delta_r': 0.0,
-            'top_n_r': 0.0,
-            'top_n_recall': 0.0
-        }
+        final_m = {k: np.mean([m[k] for m in all_metrics]) for k in all_metrics[0].keys()} if all_metrics else {}
         
-        print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Global R: {final_m['global_r']:.4f} | "
-              f"Delta R: {final_m['delta_r']:.4f} | Top50 R: {final_m['top_n_r']:.4f} | "
-              f"Top50 Recall: {final_m['top_n_recall']:.4f}")
+        print(
+            f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
+            f"All Pearson: {final_m.get('all_pearson', 0.0):.4f} | Delta Pearson: {final_m.get('delta_pearson', 0.0):.4f} | "
+            f"Top20 MSE: {final_m.get('top20_mse', 0.0):.4f} | Top20 Pearson: {final_m.get('top20_pearson', 0.0):.4f} | "
+            f"Top50 Recall: {final_m.get('top50_recall', 0.0):.4f}"
+        )
         
         if epoch >= warmup_epochs:
             main_scheduler.step()
         
         # 核心：以 Top50 Pearson 作为保存和早停的依据
-        current_score = final_m['top_n_r']
+        current_score = -final_m.get('top20_mse', float('inf'))  # 越小越好 -> 取负号后越大越好
         if current_score > best_score:
             best_score = current_score
             torch.save({
@@ -376,7 +396,7 @@ def train():
                 'n_cell_lines': n_cell_lines,
                 'baselines': processor.cell_line_baselines
             }, os.path.join(args.save_dir, "best_model.pth"))
-            print(f"*** 发现更优模型 (Top50 R: {best_score:.4f}), 已保存")
+            print(f"*** 发现更优模型 (Val Top20 DE MSE: {-best_score:.6f}), 已保存")
 
         # 每个 epoch 保存 checkpoint，并仅保留最近 N 个
         epoch_ckpt = {
