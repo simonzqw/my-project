@@ -130,7 +130,7 @@ class DataProcessor:
         print(f">>> 数据加载完成: {self.adata.n_obs} 细胞, {self.adata.n_vars} 基因")
         return self.adata.n_vars, len(self.perturb_categories), len(self.cell_line_categories)
 
-    def prepare_loaders(self, batch_size=2048, rna_noise=0.1, gene_mask_rate=0.05, scale_rate=0.05):
+    def prepare_loaders(self, batch_size=2048, rna_noise=0.1, gene_mask_rate=0.05, scale_rate=0.05, num_workers=4):
         X = self.adata.X
         perturb_ids = self.adata.obs['perturbation'].cat.codes.values
         cell_line_col = 'cell_line' if 'cell_line' in self.adata.obs else 'source_batch'
@@ -249,8 +249,8 @@ class DataProcessor:
         test_ds = GenerativeDataset(X[test_idx], perturb_ids[test_idx], cell_line_ids[test_idx], test_doses,
                                    self.cell_line_baselines, 0.0, 0.0, 0.0, False)
 
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
         
         return train_loader, val_loader, test_loader
