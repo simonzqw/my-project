@@ -232,6 +232,7 @@ def train():
     drug_embeddings = processor.drug_embeddings.to(device) if processor.drug_embeddings is not None else None
     ema = ExponentialMovingAverage(model, decay=args.ema_decay)
 
+
     # 4. 训练循环
     if not os.path.exists(args.save_dir): os.makedirs(args.save_dir)
     best_score = -float('inf') # 现在监控 Top50 Pearson，越大越好
