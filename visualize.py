@@ -54,11 +54,15 @@ def visualize():
         perturb_dim=state_dict['perturb_embedding.weight'].shape[1],
         cell_line_dim=state_dict['cell_line_embedding.weight'].shape[1],
         drug_dim=getattr(model_args, 'drug_dim', 2048),
-        hidden_dims=[512, 1024, 2048],
+        hidden_dims=getattr(model_args, 'hidden_dims', [512, 1024, 2048]),
         dropout=getattr(model_args, 'dropout', 0.2)
     ).to(device)
+    if 'ema_state_dict' in checkpoint and checkpoint['ema_state_dict'] is not None:
+        print(">>> 检测到 EMA 权重，优先使用 EMA 权重进行可视化评估")
+        state_dict = checkpoint['ema_state_dict']
     model.load_state_dict(state_dict)
     model.eval()
+    drug_embeddings = processor.drug_embeddings.to(device) if processor.drug_embeddings is not None else None
     
     # 4. 执行推理并按扰动分组
     results_by_pert = {} # {pert_name: {preds: [], targets: [], ctrls: []}}
@@ -75,8 +79,8 @@ def visualize():
             dose = batch['dose'].to(device) if 'dose' in batch else None
             
             drug_feat = None
-            if processor.drug_embeddings is not None:
-                drug_feat = processor.drug_embeddings[perturb].to(device)
+            if drug_embeddings is not None:
+                drug_feat = drug_embeddings[perturb]
             
             res = model(ctrl, perturb, cell_line, drug_feat=drug_feat, dose=dose)
             
@@ -111,7 +115,8 @@ def visualize():
         d_t = avg_t - avg_c
         
         # ROC AUC
-        top_idx = np.argsort(np.abs(d_t))[-args.top_n:]
+        top_n = min(args.top_n, len(d_t))
+        top_idx = np.argsort(np.abs(d_t))[-top_n:]
         binary_labels = np.zeros_like(d_t)
         binary_labels[top_idx] = 1
         fpr, tpr, _ = roc_curve(binary_labels, np.abs(d_p))
@@ -171,9 +176,10 @@ def visualize():
 
     # 保存测试集基因列表
     test_genes_list = sorted(df_pert['perturb'].tolist())
-    with open("test_genes_list.txt", "w") as f:
+    test_genes_path = os.path.join(os.path.dirname(args.save_path) or ".", "test_genes_list.txt")
+    with open(test_genes_path, "w") as f:
         f.write("\n".join(test_genes_list))
-    print(f">>> 已将 {len(test_genes_list)} 个测试集基因保存至: test_genes_list.txt")
+    print(f">>> 已将 {len(test_genes_list)} 个测试集基因保存至: {test_genes_path}")
 
     # 如果没找到指定的基因，自动选择测试集中 AUC 最高的基因作为备份
     if bar_plot_data is None:
