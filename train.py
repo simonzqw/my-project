@@ -4,6 +4,8 @@ import torch.optim as optim
 import numpy as np
 import argparse
 import os
+import glob
+import re
 from tqdm import tqdm
 from scipy.stats import pearsonr
 
@@ -61,6 +63,53 @@ class EarlyStopping:
             self.counter = 0
         return self.early_stop
 
+class ExponentialMovingAverage:
+    """Simple EMA tracker for model parameters."""
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {
+            name: p.detach().clone()
+            for name, p in model.named_parameters() if p.requires_grad
+        }
+        self.backup = {}
+
+    @torch.no_grad()
+    def update(self, model):
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[name].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_shadow(self, model):
+        self.backup = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.backup[name] = p.detach().clone()
+                p.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model):
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.backup:
+                p.copy_(self.backup[name])
+        self.backup = {}
+
+def rotate_epoch_checkpoints(save_dir, keep_last_n):
+    pattern = os.path.join(save_dir, "epoch_*.pth")
+    files = glob.glob(pattern)
+    if not files:
+        return
+
+    def _epoch_num(path):
+        match = re.search(r"epoch_(\d+)\.pth$", os.path.basename(path))
+        return int(match.group(1)) if match else -1
+
+    files = sorted(files, key=_epoch_num)
+    if len(files) > keep_last_n:
+        for stale in files[:-keep_last_n]:
+            if os.path.exists(stale):
+                os.remove(stale)
+
 def get_args():
     parser = argparse.ArgumentParser(description='scERso V7: Generative Perturbation Predictor')
     parser.add_argument('--data_path', type=str, required=True, help='Path to .h5ad file')
@@ -77,6 +126,10 @@ def get_args():
     parser.add_argument('--accum_steps', type=int, default=2)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--amp', action='store_true', help='Enable mixed precision training on CUDA')
+    parser.add_argument('--resume_path', type=str, default=None, help='Path to resume checkpoint (latest.pth)')
+    parser.add_argument('--keep_last_n', type=int, default=5, help='Keep only latest N epoch checkpoints')
+    parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA decay for parameter averaging')
+    parser.add_argument('--eval_ema', action='store_true', help='Use EMA weights for final test evaluation')
     parser.add_argument('--test_size', type=float, default=0.1, help='Test set ratio (e.g. 0.1 for 10%)')
     parser.add_argument('--val_size', type=float, default=0.1, help='Validation set ratio (e.g. 0.1 for 10%)')
 
@@ -177,14 +230,34 @@ def train():
     scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
     control_id = processor.perturb_map.get('control', None)
     drug_embeddings = processor.drug_embeddings.to(device) if processor.drug_embeddings is not None else None
+    ema = ExponentialMovingAverage(model, decay=args.ema_decay)
+
 
     # 4. 训练循环
     if not os.path.exists(args.save_dir): os.makedirs(args.save_dir)
     best_score = -float('inf') # 现在监控 Top50 Pearson，越大越好
     early_stopper = EarlyStopping(patience=args.patience)
     warmup_epochs = 5
+    start_epoch = 0
+
+    if args.resume_path is not None:
+        print(f">>> 检测到断点续训: {args.resume_path}")
+        resume_ckpt = torch.load(args.resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(resume_ckpt['model_state_dict'])
+        optimizer.load_state_dict(resume_ckpt['optimizer_state_dict'])
+        if 'scheduler_state_dict' in resume_ckpt:
+            main_scheduler.load_state_dict(resume_ckpt['scheduler_state_dict'])
+        if 'scaler_state_dict' in resume_ckpt and resume_ckpt['scaler_state_dict'] is not None:
+            scaler.load_state_dict(resume_ckpt['scaler_state_dict'])
+        if 'ema_state_dict' in resume_ckpt and resume_ckpt['ema_state_dict'] is not None:
+            ema.shadow = {k: v.to(device) for k, v in resume_ckpt['ema_state_dict'].items()}
+        best_score = resume_ckpt.get('best_score', best_score)
+        start_epoch = resume_ckpt.get('epoch', -1) + 1
+        early_stopper.best_score = resume_ckpt.get('early_stopping_best_score', early_stopper.best_score)
+        early_stopper.counter = resume_ckpt.get('early_stopping_counter', early_stopper.counter)
+        print(f">>> 从 epoch {start_epoch} 继续训练")
     
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         # Warmup
         if epoch < warmup_epochs:
             curr_lr_factor = (epoch + 1) / warmup_epochs
@@ -232,6 +305,7 @@ def train():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
+                ema.update(model)
                 optimizer.zero_grad()
             
             train_loss += loss.item()
@@ -242,6 +316,7 @@ def train():
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+            ema.update(model)
             optimizer.zero_grad()
 
         # 验证集评估
@@ -294,6 +369,7 @@ def train():
             best_score = current_score
             torch.save({
                 'model_state_dict': model.state_dict(),
+                'ema_state_dict': ema.shadow,
                 'args': args,
                 'n_genes': n_genes,
                 'n_perts': n_perts,
@@ -301,6 +377,27 @@ def train():
                 'baselines': processor.cell_line_baselines
             }, os.path.join(args.save_dir, "best_model.pth"))
             print(f"*** 发现更优模型 (Top50 R: {best_score:.4f}), 已保存")
+
+        # 每个 epoch 保存 checkpoint，并仅保留最近 N 个
+        epoch_ckpt = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': main_scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict() if (args.amp and device.type == "cuda") else None,
+            'ema_state_dict': ema.shadow,
+            'best_score': best_score,
+            'early_stopping_best_score': early_stopper.best_score,
+            'early_stopping_counter': early_stopper.counter,
+            'args': args,
+            'n_genes': n_genes,
+            'n_perts': n_perts,
+            'n_cell_lines': n_cell_lines,
+            'baselines': processor.cell_line_baselines
+        }
+        torch.save(epoch_ckpt, os.path.join(args.save_dir, f"epoch_{epoch+1:03d}.pth"))
+        torch.save(epoch_ckpt, os.path.join(args.save_dir, "latest.pth"))
+        rotate_epoch_checkpoints(args.save_dir, args.keep_last_n)
         
         if early_stopper(current_score):
             print(f"!!! 早停触发 (核心基因拟合已达瓶颈)")
@@ -309,8 +406,12 @@ def train():
     # 5. 最终测试集评估 (使用保存的最佳权重)
     print("\n" + "="*30)
     print(">>> 正在进行最终测试集 (Test Set) 评估...")
-    best_ckpt = torch.load(os.path.join(args.save_dir, "best_model.pth"), weights_only=False)
+    best_ckpt = torch.load(os.path.join(args.save_dir, "best_model.pth"), map_location=device, weights_only=False)
     model.load_state_dict(best_ckpt['model_state_dict'])
+    if args.eval_ema and ('ema_state_dict' in best_ckpt) and (best_ckpt['ema_state_dict'] is not None):
+        print(">>> 使用 EMA 权重进行最终测试评估")
+        ema.shadow = {k: v.to(device) for k, v in best_ckpt['ema_state_dict'].items()}
+        ema.apply_shadow(model)
     model.eval()
     
     test_metrics = []
@@ -343,6 +444,8 @@ def train():
     print(f"Top50 Pearson: {final_test_m['top_n_r']:.4f}")
     print(f"Top50 Recall: {final_test_m['top_n_recall']:.4f}")
     print("="*30)
+    if args.eval_ema and ('ema_state_dict' in best_ckpt) and (best_ckpt['ema_state_dict'] is not None):
+        ema.restore(model)
 
 if __name__ == "__main__":
     train()
