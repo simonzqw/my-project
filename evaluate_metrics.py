@@ -97,7 +97,7 @@ def get_args():
     parser.add_argument('--split_strategy', type=str, default='perturbation', choices=['random', 'perturbation'])
     parser.add_argument('--test_size', type=float, default=0.1)
     parser.add_argument('--val_size', type=float, default=0.1)
-    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--use_ema', action='store_true', help='Evaluate with ema_state_dict if available')
     parser.add_argument('--output_json', type=str, default=None, help='Optional path to dump metrics json')
     return parser.parse_args()

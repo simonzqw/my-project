@@ -112,11 +112,15 @@ class DataProcessor:
         # --- 核心新增: 计算每个细胞系的平均控制组表达谱 (Baseline) ---
         print(">>> 正在计算细胞系基线表达谱...")
         self.cell_line_baselines = {}
+        cell_line_values = self.adata.obs[cell_line_col].values
+        pert_values = self.adata.obs['perturbation'].values
+        X = self.adata.X
         for cl_name, cl_id in self.cell_line_map.items():
-            ctrl_mask = (self.adata.obs[cell_line_col] == cl_name) & (self.adata.obs['perturbation'] == 'control')
-            ctrl_adata = self.adata[ctrl_mask]
-            if ctrl_adata.n_obs > 0:
-                avg_expr = ctrl_adata.X.mean(axis=0)
+            ctrl_mask = (cell_line_values == cl_name) & (pert_values == 'control')
+            ctrl_idx = np.where(ctrl_mask)[0]
+            if len(ctrl_idx) > 0:
+                # 直接对 X 子矩阵求均值，避免频繁构建 AnnData 切片带来的额外内存开销
+                avg_expr = X[ctrl_idx].mean(axis=0)
                 if issparse(avg_expr): avg_expr = avg_expr.toarray()
                 # 确保转换为 1D numpy array
                 avg_expr = np.asarray(avg_expr).flatten()
