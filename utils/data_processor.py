@@ -112,11 +112,15 @@ class DataProcessor:
         # --- 核心新增: 计算每个细胞系的平均控制组表达谱 (Baseline) ---
         print(">>> 正在计算细胞系基线表达谱...")
         self.cell_line_baselines = {}
+        cell_line_values = self.adata.obs[cell_line_col].values
+        pert_values = self.adata.obs['perturbation'].values
+        X = self.adata.X
         for cl_name, cl_id in self.cell_line_map.items():
-            ctrl_mask = (self.adata.obs[cell_line_col] == cl_name) & (self.adata.obs['perturbation'] == 'control')
-            ctrl_adata = self.adata[ctrl_mask]
-            if ctrl_adata.n_obs > 0:
-                avg_expr = ctrl_adata.X.mean(axis=0)
+            ctrl_mask = (cell_line_values == cl_name) & (pert_values == 'control')
+            ctrl_idx = np.where(ctrl_mask)[0]
+            if len(ctrl_idx) > 0:
+                # 直接对 X 子矩阵求均值，避免频繁构建 AnnData 切片带来的额外内存开销
+                avg_expr = X[ctrl_idx].mean(axis=0)
                 if issparse(avg_expr): avg_expr = avg_expr.toarray()
                 # 确保转换为 1D numpy array
                 avg_expr = np.asarray(avg_expr).flatten()
@@ -130,7 +134,7 @@ class DataProcessor:
         print(f">>> 数据加载完成: {self.adata.n_obs} 细胞, {self.adata.n_vars} 基因")
         return self.adata.n_vars, len(self.perturb_categories), len(self.cell_line_categories)
 
-    def prepare_loaders(self, batch_size=2048, rna_noise=0.1, gene_mask_rate=0.05, scale_rate=0.05):
+    def prepare_loaders(self, batch_size=2048, rna_noise=0.1, gene_mask_rate=0.05, scale_rate=0.05, num_workers=4):
         X = self.adata.X
         perturb_ids = self.adata.obs['perturbation'].cat.codes.values
         cell_line_col = 'cell_line' if 'cell_line' in self.adata.obs else 'source_batch'
@@ -249,8 +253,8 @@ class DataProcessor:
         test_ds = GenerativeDataset(X[test_idx], perturb_ids[test_idx], cell_line_ids[test_idx], test_doses,
                                    self.cell_line_baselines, 0.0, 0.0, 0.0, False)
 
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
         
         return train_loader, val_loader, test_loader
