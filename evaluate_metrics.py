@@ -152,12 +152,17 @@ def main():
     ckpt = torch.load(args.model_path, map_location=device, weights_only=False)
     state_dict = ckpt['ema_state_dict'] if (args.use_ema and ('ema_state_dict' in ckpt) and ckpt['ema_state_dict'] is not None) else ckpt['model_state_dict']
     model_args = ckpt.get('args', None)
+    pretrained_weights = state_dict['perturb_feature_bank'] if 'perturb_feature_bank' in state_dict else None
+    perturb_weight_for_shape = state_dict['perturb_embedding.weight'] if 'perturb_embedding.weight' in state_dict else None
+    perturb_dim = int(perturb_weight_for_shape.shape[1]) if perturb_weight_for_shape is not None else int(pretrained_weights.shape[1])
+    n_perturbations = int(perturb_weight_for_shape.shape[0]) if perturb_weight_for_shape is not None else int(pretrained_weights.shape[0])
 
     model = PerturbationPredictor(
         n_genes=n_genes,
-        n_perturbations=state_dict['perturb_embedding.weight'].shape[0],
+        n_perturbations=n_perturbations,
         n_cell_lines=state_dict['cell_line_embedding.weight'].shape[0],
-        perturb_dim=state_dict['perturb_embedding.weight'].shape[1],
+        pretrained_weights=pretrained_weights,
+        perturb_dim=perturb_dim,
         cell_line_dim=state_dict['cell_line_embedding.weight'].shape[1],
         drug_dim=getattr(model_args, 'drug_dim', 2048),
         hidden_dims=getattr(model_args, 'hidden_dims', [512, 1024, 2048]),

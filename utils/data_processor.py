@@ -139,6 +139,12 @@ class DataProcessor:
         perturb_ids = self.adata.obs['perturbation'].cat.codes.values
         cell_line_col = 'cell_line' if 'cell_line' in self.adata.obs else 'source_batch'
         cell_line_ids = self.adata.obs[cell_line_col].cat.codes.values
+        control_id = self.perturb_map.get('control', None)
+
+        batch_ids = None
+        if 'batch' in self.adata.obs:
+            self.adata.obs['batch'] = self.adata.obs['batch'].astype('category')
+            batch_ids = self.adata.obs['batch'].cat.codes.values
         
         # --- 核心新增: 剂量信息处理 ---
         # 1. 提取剂量
@@ -193,32 +199,88 @@ class DataProcessor:
             train_idx, temp = train_test_split(indices, test_size=(self.val_size+self.test_size), random_state=42)
             val_idx, test_idx = train_test_split(temp, test_size=0.5, random_state=42)
 
+        # 构造 control pool: 同 cell_line 优先；若存在 batch，则优先同 (cell_line, batch)
+        control_pool_coarse = {}
+        control_pool_fine = {}
+        all_ctrl_idx = np.where(perturb_ids == control_id)[0] if control_id is not None else np.array([], dtype=np.int64)
+
+        for gidx in all_ctrl_idx:
+            c_id = int(cell_line_ids[gidx])
+            control_pool_coarse.setdefault(c_id, []).append(int(gidx))
+            if batch_ids is not None:
+                b_id = int(batch_ids[gidx])
+                control_pool_fine.setdefault((c_id, b_id), []).append(int(gidx))
+
+        if len(all_ctrl_idx) == 0:
+            raise ValueError("未找到 control 样本，无法构建 control pool。")
+
         class GenerativeDataset(Dataset):
-            def __init__(self, rna, p_ids, c_ids, doses, baselines, rna_noise=0.0, gene_mask_rate=0.0, scale_rate=0.0, is_train=True):
-                self.rna = rna
+            def __init__(
+                self,
+                full_rna,
+                sample_indices,
+                p_ids,
+                c_ids,
+                doses,
+                control_id,
+                control_pool_coarse,
+                control_pool_fine=None,
+                local_batch_ids=None,
+                rna_noise=0.0,
+                gene_mask_rate=0.0,
+                scale_rate=0.0,
+                is_train=True,
+                seed=42
+            ):
+                self.full_rna = full_rna
+                self.sample_indices = sample_indices
                 self.p_ids = p_ids
                 self.c_ids = c_ids
-                self.doses = doses # 新增 dose
-                self.baselines = baselines
+                self.doses = doses
+                self.control_id = control_id
+                self.control_pool_coarse = control_pool_coarse
+                self.control_pool_fine = control_pool_fine
+                self.local_batch_ids = local_batch_ids
                 self.rna_noise = rna_noise
                 self.gene_mask_rate = gene_mask_rate
                 self.scale_rate = scale_rate
                 self.is_train = is_train
+                self.rng = np.random.RandomState(seed)
+                self.global_control_fallback = np.concatenate([np.array(v, dtype=np.int64) for v in self.control_pool_coarse.values()])
+                self.fixed_ctrl_idx = []
+
+                if not self.is_train:
+                    for i in range(len(self.p_ids)):
+                        p_id = int(self.p_ids[i])
+                        c_id = int(self.c_ids[i])
+                        if p_id == self.control_id:
+                            self.fixed_ctrl_idx.append(None)
+                            continue
+                        candidates = self._get_control_candidates(i, c_id)
+                        self.fixed_ctrl_idx.append(int(self.rng.choice(candidates)))
 
             def __len__(self):
                 return len(self.p_ids)
 
             def __getitem__(self, idx):
                 # 目标：真实扰动后的表达谱
-                target_rna = self._get_rna(idx)
-                c_id = self.c_ids[idx]
-                p_id = self.p_ids[idx]
+                target_rna = self._get_rna_from_global(self.sample_indices[idx])
+                c_id = int(self.c_ids[idx])
+                p_id = int(self.p_ids[idx])
                 
                 # 剂量信息
                 dose_val = self.doses[idx] if self.doses is not None else torch.tensor(0.0)
                 
-                # 输入：对应细胞系的平均控制组表达谱 (Baseline)
-                input_rna = self.baselines[c_id].clone()
+                # 输入 control：同背景 control 细胞采样（control 样本本身则使用自身）
+                if p_id == self.control_id:
+                    input_rna = target_rna.clone()
+                else:
+                    if self.is_train:
+                        candidates = self._get_control_candidates(idx, c_id)
+                        ctrl_gidx = int(self.rng.choice(candidates))
+                    else:
+                        ctrl_gidx = self.fixed_ctrl_idx[idx]
+                    input_rna = self._get_rna_from_global(ctrl_gidx)
                 
                 # --- 数据增强 (仅训练集，作用于目标或输入) ---
                 if self.is_train:
@@ -236,8 +298,18 @@ class DataProcessor:
                     'dose': dose_val # 返回 dose
                 }
 
-            def _get_rna(self, idx):
-                row = self.rna[idx]
+            def _get_control_candidates(self, local_idx, c_id):
+                if self.local_batch_ids is not None and self.control_pool_fine is not None:
+                    b_id = int(self.local_batch_ids[local_idx])
+                    key = (c_id, b_id)
+                    if key in self.control_pool_fine and len(self.control_pool_fine[key]) > 0:
+                        return self.control_pool_fine[key]
+                if c_id in self.control_pool_coarse and len(self.control_pool_coarse[c_id]) > 0:
+                    return self.control_pool_coarse[c_id]
+                return self.global_control_fallback
+
+            def _get_rna_from_global(self, global_idx):
+                row = self.full_rna[global_idx]
                 if issparse(row): row = row.toarray().flatten()
                 return torch.tensor(row, dtype=torch.float32)
 
@@ -246,12 +318,52 @@ class DataProcessor:
         val_doses = self.doses[val_idx] if self.doses is not None else None
         test_doses = self.doses[test_idx] if self.doses is not None else None
 
-        train_ds = GenerativeDataset(X[train_idx], perturb_ids[train_idx], cell_line_ids[train_idx], train_doses,
-                                    self.cell_line_baselines, rna_noise, gene_mask_rate, scale_rate, True)
-        val_ds = GenerativeDataset(X[val_idx], perturb_ids[val_idx], cell_line_ids[val_idx], val_doses,
-                                  self.cell_line_baselines, 0.0, 0.0, 0.0, False)
-        test_ds = GenerativeDataset(X[test_idx], perturb_ids[test_idx], cell_line_ids[test_idx], test_doses,
-                                   self.cell_line_baselines, 0.0, 0.0, 0.0, False)
+        train_local_batch = batch_ids[train_idx] if batch_ids is not None else None
+        val_local_batch = batch_ids[val_idx] if batch_ids is not None else None
+        test_local_batch = batch_ids[test_idx] if batch_ids is not None else None
+
+        train_ds = GenerativeDataset(
+            full_rna=X,
+            sample_indices=train_idx,
+            p_ids=perturb_ids[train_idx],
+            c_ids=cell_line_ids[train_idx],
+            doses=train_doses,
+            control_id=control_id,
+            control_pool_coarse=control_pool_coarse,
+            control_pool_fine=control_pool_fine if batch_ids is not None else None,
+            local_batch_ids=train_local_batch,
+            rna_noise=rna_noise,
+            gene_mask_rate=gene_mask_rate,
+            scale_rate=scale_rate,
+            is_train=True,
+            seed=42
+        )
+        val_ds = GenerativeDataset(
+            full_rna=X,
+            sample_indices=val_idx,
+            p_ids=perturb_ids[val_idx],
+            c_ids=cell_line_ids[val_idx],
+            doses=val_doses,
+            control_id=control_id,
+            control_pool_coarse=control_pool_coarse,
+            control_pool_fine=control_pool_fine if batch_ids is not None else None,
+            local_batch_ids=val_local_batch,
+            is_train=False,
+            seed=42
+        )
+        test_ds = GenerativeDataset(
+            full_rna=X,
+            sample_indices=test_idx,
+            p_ids=perturb_ids[test_idx],
+            c_ids=cell_line_ids[test_idx],
+            doses=test_doses,
+            control_id=control_id,
+            control_pool_coarse=control_pool_coarse,
+            control_pool_fine=control_pool_fine if batch_ids is not None else None,
+            local_batch_ids=test_local_batch,
+            is_train=False,
+            seed=42
+        )
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)

@@ -217,6 +217,11 @@ def train():
         split_strategy=args.split_strategy
     )
     n_genes, n_perts, n_cell_lines = processor.load_data()
+    if args.split_strategy == 'perturbation' and args.pretrained_emb is None and processor.drug_embeddings is None:
+        raise ValueError(
+            "当前是 unseen perturbation 划分，必须提供 side information（如 --pretrained_emb 或 SMILES 药物特征），"
+            "否则 perturbation 只能依赖 ID embedding，泛化会明显受限。"
+        )
     train_loader, val_loader, test_loader = processor.prepare_loaders(
         batch_size=args.batch_size,
         rna_noise=args.noise,
@@ -228,6 +233,11 @@ def train():
     if args.pretrained_emb:
         loader = GeneEmbeddingLoader(args.pretrained_emb, processor.id_to_perturb)
         pretrained_weights = loader.load_weights()
+    elif args.resume_path is not None and os.path.exists(args.resume_path):
+        resume_meta = torch.load(args.resume_path, map_location='cpu', weights_only=False)
+        resume_state = resume_meta.get('model_state_dict', {})
+        if 'perturb_feature_bank' in resume_state:
+            pretrained_weights = resume_state['perturb_feature_bank'].float()
 
     # 3. 初始化模型
     model = PerturbationPredictor(
@@ -244,9 +254,17 @@ def train():
     criterion = WeightedMSELoss() 
     
     # 参数分组优化
+    perturb_params = []
+    if model.use_semantic_perturb and model.perturb_encoder is not None:
+        perturb_params = list(model.perturb_encoder.parameters())
+    else:
+        perturb_params = list(model.perturb_embedding.parameters())
+
+    perturb_param_ids = {id(p) for p in perturb_params}
+    other_params = [p for p in model.parameters() if id(p) not in perturb_param_ids]
     param_groups = [
-        {'params': model.perturb_embedding.parameters(), 'lr': args.lr * 0.1, 'name': 'embedding'},
-        {'params': [p for n, p in model.named_parameters() if 'perturb_embedding' not in n], 'lr': args.lr, 'name': 'other'}
+        {'params': perturb_params, 'lr': args.lr * 0.1, 'name': 'perturb_branch'},
+        {'params': other_params, 'lr': args.lr, 'name': 'other'}
     ]
     optimizer = optim.AdamW(param_groups, weight_decay=args.weight_decay)
     main_scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
@@ -257,7 +275,7 @@ def train():
 
     # 4. 训练循环
     if not os.path.exists(args.save_dir): os.makedirs(args.save_dir)
-    best_score = -float('inf') # 现在监控 Top50 Pearson，越大越好
+    best_score = -float('inf') # 监控 -Top20 MSE，越大越好（等价于 Top20 MSE 越小越好）
     early_stopper = EarlyStopping(patience=args.patience)
     warmup_epochs = 5
     start_epoch = 0
@@ -285,6 +303,8 @@ def train():
             curr_lr_factor = (epoch + 1) / warmup_epochs
             for param_group in optimizer.param_groups:
                 base_lr = args.lr * 0.1 if param_group['name'] == 'embedding' else args.lr
+                if param_group['name'] == 'perturb_branch':
+                    base_lr = args.lr * 0.1
                 param_group['lr'] = base_lr * curr_lr_factor
 
         # 冻结策略
@@ -383,7 +403,7 @@ def train():
         if epoch >= warmup_epochs:
             main_scheduler.step()
         
-        # 核心：以 Top50 Pearson 作为保存和早停的依据
+        # 核心：以 Top20 MSE 作为保存和早停依据（越小越好）
         current_score = -final_m.get('top20_mse', float('inf'))  # 越小越好 -> 取负号后越大越好
         if current_score > best_score:
             best_score = current_score
@@ -452,17 +472,13 @@ def train():
             m = calculate_metrics(outputs.cpu().numpy(), target.cpu().numpy(), ctrl.cpu().numpy())
             test_metrics.append(m)
     
-    final_test_m = {k: np.mean([m[k] for m in test_metrics]) for k in test_metrics[0].keys()} if test_metrics else {
-        'global_r': 0.0,
-        'delta_r': 0.0,
-        'top_n_r': 0.0,
-        'top_n_recall': 0.0
-    }
+    final_test_m = {k: np.mean([m[k] for m in test_metrics]) for k in test_metrics[0].keys()} if test_metrics else {}
     print(f"!!! 最终评估结果 (Test Set) !!!")
-    print(f"Global Pearson: {final_test_m['global_r']:.4f}")
-    print(f"Delta Pearson: {final_test_m['delta_r']:.4f}")
-    print(f"Top50 Pearson: {final_test_m['top_n_r']:.4f}")
-    print(f"Top50 Recall: {final_test_m['top_n_recall']:.4f}")
+    print(f"All Pearson: {final_test_m.get('all_pearson', 0.0):.4f}")
+    print(f"Delta Pearson: {final_test_m.get('delta_pearson', 0.0):.4f}")
+    print(f"Top20 MSE: {final_test_m.get('top20_mse', 0.0):.4f}")
+    print(f"Top20 Pearson: {final_test_m.get('top20_pearson', 0.0):.4f}")
+    print(f"Top50 Recall: {final_test_m.get('top50_recall', 0.0):.4f}")
     print("="*30)
     if args.eval_ema and ('ema_state_dict' in best_ckpt) and (best_ckpt['ema_state_dict'] is not None):
         ema.restore(model)
