@@ -147,7 +147,7 @@ def _safe_pearson(x, y):
     r, _ = pearsonr(x, y)
     return r if not np.isnan(r) else np.nan
 
-def calculate_metrics(pred, target, ctrl):
+def calculate_metrics(pred, target, ctrl, de_eps=1e-3):
     """
     返回更完整的指标:
     - 全谱: all_mse / all_pearson
@@ -182,7 +182,7 @@ def calculate_metrics(pred, target, ctrl):
         if not np.isnan(r_delta):
             collector['delta_pearson'].append(r_delta)
 
-        non_dropout_mask = np.abs(d_t) > 1e-8
+        non_dropout_mask = np.abs(d_t) > de_eps
         if np.any(non_dropout_mask):
             collector['all_de_mse'].append(float(np.mean((d_p[non_dropout_mask] - d_t[non_dropout_mask]) ** 2)))
             r_de = _safe_pearson(d_p[non_dropout_mask], d_t[non_dropout_mask])

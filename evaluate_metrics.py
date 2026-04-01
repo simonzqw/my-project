@@ -15,7 +15,30 @@ def safe_pearson(x, y):
     return r if not np.isnan(r) else np.nan
 
 
-def collect_metrics(pred, target, ctrl, top_ks=(10, 20, 50), dropout_eps=1e-8):
+def _build_de_mask(delta_true, mode='threshold', dropout_eps=1e-3, de_topk=200, de_quantile=0.9):
+    abs_dt = np.abs(delta_true)
+    if mode == 'topk':
+        k = min(de_topk, len(abs_dt))
+        idx = np.argsort(abs_dt)[-k:]
+        mask = np.zeros_like(abs_dt, dtype=bool)
+        mask[idx] = True
+        return mask
+    if mode == 'quantile':
+        q = np.quantile(abs_dt, de_quantile)
+        return abs_dt >= q
+    return abs_dt > dropout_eps
+
+
+def collect_metrics(
+    pred,
+    target,
+    ctrl,
+    top_ks=(10, 20, 50),
+    dropout_eps=1e-3,
+    de_mode='threshold',
+    de_topk=200,
+    de_quantile=0.9
+):
     metrics = {
         'all_mse': [],
         'all_pearson': [],
@@ -45,7 +68,13 @@ def collect_metrics(pred, target, ctrl, top_ks=(10, 20, 50), dropout_eps=1e-8):
         if not np.isnan(r_delta):
             metrics['delta_pearson'].append(r_delta)
 
-        non_dropout_mask = np.abs(d_t) > dropout_eps
+        non_dropout_mask = _build_de_mask(
+            d_t,
+            mode=de_mode,
+            dropout_eps=dropout_eps,
+            de_topk=de_topk,
+            de_quantile=de_quantile
+        )
         if np.any(non_dropout_mask):
             d_p_n = d_p[non_dropout_mask]
             d_t_n = d_t[non_dropout_mask]
@@ -64,7 +93,7 @@ def collect_metrics(pred, target, ctrl, top_ks=(10, 20, 50), dropout_eps=1e-8):
 
         k20 = min(20, len(d_t))
         top20_idx = np.argsort(np.abs(d_t))[-k20:]
-        top20_non_dropout = top20_idx[np.abs(d_t[top20_idx]) > dropout_eps]
+        top20_non_dropout = top20_idx[non_dropout_mask[top20_idx]]
         if len(top20_non_dropout) > 0:
             t20 = d_t[top20_non_dropout]
             p20 = d_p[top20_non_dropout]
@@ -100,6 +129,10 @@ def get_args():
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--use_ema', action='store_true', help='Evaluate with ema_state_dict if available')
     parser.add_argument('--output_json', type=str, default=None, help='Optional path to dump metrics json')
+    parser.add_argument('--dropout_eps', type=float, default=1e-3, help='DE threshold when de_mode=threshold')
+    parser.add_argument('--de_mode', type=str, default='threshold', choices=['threshold', 'topk', 'quantile'])
+    parser.add_argument('--de_topk', type=int, default=200, help='DE topK when de_mode=topk')
+    parser.add_argument('--de_quantile', type=float, default=0.9, help='DE quantile when de_mode=quantile')
     return parser.parse_args()
 
 
@@ -150,7 +183,11 @@ def main():
             m = collect_metrics(
                 pred.cpu().numpy(),
                 target.cpu().numpy(),
-                ctrl.cpu().numpy()
+                ctrl.cpu().numpy(),
+                dropout_eps=args.dropout_eps,
+                de_mode=args.de_mode,
+                de_topk=args.de_topk,
+                de_quantile=args.de_quantile
             )
             per_batch_metrics.append(m)
 
@@ -174,6 +211,12 @@ def main():
         "top50_pearson": final_m["top50_pearson"],
         "all_mse": final_m["all_mse"],
         "all_pearson": final_m["all_pearson"]
+    }
+    report["metric_config"] = {
+        "de_mode": args.de_mode,
+        "dropout_eps": args.dropout_eps,
+        "de_topk": args.de_topk,
+        "de_quantile": args.de_quantile
     }
 
     print(json.dumps(report, ensure_ascii=False, indent=2))
