@@ -66,6 +66,9 @@ def visualize():
         hidden_dims=getattr(model_args, 'hidden_dims', [512, 1024, 2048]),
         dropout=getattr(model_args, 'dropout', 0.2)
     ).to(device)
+    if 'ema_state_dict' in checkpoint and checkpoint['ema_state_dict'] is not None:
+        print(">>> 检测到 EMA 权重，优先使用 EMA 权重进行可视化评估")
+        state_dict = checkpoint['ema_state_dict']
     model.load_state_dict(state_dict)
     model.eval()
     drug_embeddings = processor.drug_embeddings.to(device) if processor.drug_embeddings is not None else None
