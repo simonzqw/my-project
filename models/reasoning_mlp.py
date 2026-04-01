@@ -16,13 +16,25 @@ class PerturbationPredictor(nn.Module):
         
         self.n_genes = n_genes
         self.perturb_dim = perturb_dim
+        self.use_semantic_perturb = pretrained_weights is not None
         
-        # 1. 嵌入层 (基因)
-        if pretrained_weights is not None:
-            self.perturb_embedding = nn.Embedding.from_pretrained(pretrained_weights, freeze=False)
-            perturb_dim = pretrained_weights.shape[1]
+        # 1. 扰动表示层 (基因)
+        # 语义模式: 使用固定 feature bank + 可训练 projector
+        # fallback: 继续使用可训练 ID embedding
+        self.perturb_embedding = nn.Embedding(n_perturbations, perturb_dim)
+        if self.use_semantic_perturb:
+            self.register_buffer("perturb_feature_bank", pretrained_weights.float())
+            in_dim = pretrained_weights.shape[1]
+            self.perturb_encoder = nn.Sequential(
+                nn.Linear(in_dim, 512),
+                nn.LayerNorm(512),
+                nn.LeakyReLU(0.2),
+                nn.Dropout(0.1),
+                nn.Linear(512, perturb_dim),
+                nn.LayerNorm(perturb_dim)
+            )
         else:
-            self.perturb_embedding = nn.Embedding(n_perturbations, perturb_dim)
+            self.perturb_encoder = None
             
         # 1.5 投影层 (药物)
         # 将高维药物特征 (2048) 映射到统一的 Latent 空间 (200)
@@ -54,7 +66,11 @@ class PerturbationPredictor(nn.Module):
             nn.Linear(512, perturb_dim),
             nn.LayerNorm(perturb_dim)
         )
-        self.cell_line_projection = nn.Linear(cell_line_dim, perturb_dim)
+        self.cell_line_projection = nn.Sequential(
+            nn.Linear(cell_line_dim, perturb_dim),
+            nn.LayerNorm(perturb_dim),
+            nn.Dropout(0.2)
+        )
         
         # 3. 多头注意力融合 (提取扰动对全局的影响权重)
         self.feature_fusion = nn.MultiheadAttention(embed_dim=perturb_dim, num_heads=4, batch_first=True)
@@ -117,8 +133,12 @@ class PerturbationPredictor(nn.Module):
                 p_emb = p_emb * scale
                 
         else:
-            # 基因模式: 使用 Gene Embedding
-            p_emb = self.perturb_embedding(perturb)
+            # 基因模式: 语义编码优先，fallback 到 ID embedding
+            if self.use_semantic_perturb:
+                p_raw = self.perturb_feature_bank[perturb]
+                p_emb = self.perturb_encoder(p_raw)
+            else:
+                p_emb = self.perturb_embedding(perturb)
             
         c_emb = self.cell_line_embedding(cell_line)
         
@@ -143,6 +163,9 @@ class PerturbationPredictor(nn.Module):
 
     def freeze_perturbation_embedding(self, freeze=True):
         """控制 Embedding 层的更新，用于训练初期的稳定性"""
+        if self.use_semantic_perturb:
+            # 语义模式下主要训练 perturb_encoder；ID embedding 不是主干
+            return
         self.perturb_embedding.weight.requires_grad = not freeze
         state = "冻结" if freeze else "解冻"
         print(f">>> 扰动 Embedding 层已 {state}")
