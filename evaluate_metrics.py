@@ -152,8 +152,15 @@ def main():
     ckpt = torch.load(args.model_path, map_location=device, weights_only=False)
     state_dict = ckpt['ema_state_dict'] if (args.use_ema and ('ema_state_dict' in ckpt) and ckpt['ema_state_dict'] is not None) else ckpt['model_state_dict']
     model_args = ckpt.get('args', None)
+    has_perturb_encoder = any(k.startswith('perturb_encoder.') for k in state_dict.keys())
     pretrained_weights = state_dict['perturb_feature_bank'] if 'perturb_feature_bank' in state_dict else None
     perturb_weight_for_shape = state_dict['perturb_embedding.weight'] if 'perturb_embedding.weight' in state_dict else None
+    # 兼容旧 checkpoint：存在 perturb_encoder 参数但没有 perturb_feature_bank
+    # 这时用 perturb_embedding.weight 作为 feature_bank 构建语义分支结构，确保能完整加载权重。
+    if pretrained_weights is None and has_perturb_encoder and perturb_weight_for_shape is not None:
+        pretrained_weights = perturb_weight_for_shape.detach().clone()
+    missing_feature_bank_in_ckpt = has_perturb_encoder and ('perturb_feature_bank' not in state_dict)
+
     perturb_dim = int(perturb_weight_for_shape.shape[1]) if perturb_weight_for_shape is not None else int(pretrained_weights.shape[1])
     n_perturbations = int(perturb_weight_for_shape.shape[0]) if perturb_weight_for_shape is not None else int(pretrained_weights.shape[0])
 
@@ -166,9 +173,14 @@ def main():
         cell_line_dim=state_dict['cell_line_embedding.weight'].shape[1],
         drug_dim=getattr(model_args, 'drug_dim', 2048),
         hidden_dims=getattr(model_args, 'hidden_dims', [512, 1024, 2048]),
-        dropout=getattr(model_args, 'dropout', 0.2)
+        dropout=getattr(model_args, 'dropout', 0.2),
+        d_model=getattr(model_args, 'd_model', 256),
+        nhead=getattr(model_args, 'nhead', 8),
+        num_layers=getattr(model_args, 'num_layers', 4),
+        dim_ff=getattr(model_args, 'dim_ff', 1024),
+        n_ctrl_tokens=getattr(model_args, 'n_ctrl_tokens', 8)
     ).to(device)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=not missing_feature_bank_in_ckpt)
     model.eval()
 
     drug_embeddings = processor.drug_embeddings.to(device) if processor.drug_embeddings is not None else None

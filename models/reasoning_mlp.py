@@ -1,26 +1,41 @@
 import torch
 import torch.nn as nn
 
+
 class PerturbationPredictor(nn.Module):
     """
-    scERso V10: 药物/基因双模态扰动预测模型
-    兼容：
-    1. Gene ID -> Gene2Vec Embedding
-    2. Drug Feature -> Linear Projection
+    Transformer-based generative perturbation predictor.
+
+    Core idea:
+    - Build token sequence from control state + perturbation/cell/dose conditions.
+    - Use TransformerEncoder as the main interaction backbone.
+    - Decode delta expression and add residual to control input.
     """
-    def __init__(self, n_genes, n_perturbations, n_cell_lines, 
-                 pretrained_weights=None,
-                 perturb_dim=200, cell_line_dim=32, drug_dim=2048,
-                 hidden_dims=[512, 1024, 2048], dropout=0.2):
+    def __init__(
+        self,
+        n_genes,
+        n_perturbations,
+        n_cell_lines,
+        pretrained_weights=None,
+        perturb_dim=200,
+        cell_line_dim=32,
+        drug_dim=2048,
+        hidden_dims=[512, 1024, 2048],
+        dropout=0.2,
+        d_model=256,
+        nhead=8,
+        num_layers=4,
+        dim_ff=1024,
+        n_ctrl_tokens=8
+    ):
         super(PerturbationPredictor, self).__init__()
-        
         self.n_genes = n_genes
         self.perturb_dim = perturb_dim
         self.use_semantic_perturb = pretrained_weights is not None
-        
-        # 1. 扰动表示层 (基因)
-        # 语义模式: 使用固定 feature bank + 可训练 projector
-        # fallback: 继续使用可训练 ID embedding
+        self.n_ctrl_tokens = n_ctrl_tokens
+        self.d_model = d_model
+
+        # ===== 1) Perturbation branch =====
         self.perturb_embedding = nn.Embedding(n_perturbations, perturb_dim)
         if self.use_semantic_perturb:
             self.register_buffer("perturb_feature_bank", pretrained_weights.float())
@@ -35,9 +50,7 @@ class PerturbationPredictor(nn.Module):
             )
         else:
             self.perturb_encoder = None
-            
-        # 1.5 投影层 (药物)
-        # 将高维药物特征 (2048) 映射到统一的 Latent 空间 (200)
+
         self.drug_projection = nn.Sequential(
             nn.Linear(drug_dim, 512),
             nn.LayerNorm(512),
@@ -45,126 +58,129 @@ class PerturbationPredictor(nn.Module):
             nn.Linear(512, perturb_dim),
             nn.LayerNorm(perturb_dim)
         )
-        
-        # 1.6 剂量调制模块 (Dose Modulator)
-        # 输入: 标量 Dose [0, 1] -> 输出: 缩放因子 [B, perturb_dim]
-        # 逻辑: 剂量越大，缩放因子越大 (Sigmoid * 2 允许放大到 2 倍)
+
         self.dose_scaler = nn.Sequential(
             nn.Linear(1, 64),
             nn.ReLU(),
             nn.Linear(64, perturb_dim),
-            nn.Sigmoid() 
+            nn.Sigmoid()
         )
-            
+
         self.cell_line_embedding = nn.Embedding(n_cell_lines, cell_line_dim)
-        
-        # 2. 投影层 (用于 MHA)
-        self.rna_projection = nn.Sequential(
-            nn.Linear(n_genes, 512),
-            nn.LayerNorm(512),
-            nn.LeakyReLU(0.2),
-            nn.Linear(512, perturb_dim),
-            nn.LayerNorm(perturb_dim)
-        )
         self.cell_line_projection = nn.Sequential(
             nn.Linear(cell_line_dim, perturb_dim),
             nn.LayerNorm(perturb_dim),
             nn.Dropout(0.2)
         )
-        
-        # 3. 多头注意力融合 (提取扰动对全局的影响权重)
-        self.feature_fusion = nn.MultiheadAttention(embed_dim=perturb_dim, num_heads=4, batch_first=True)
-        
-        # 4. 解码网络 (预测 Delta 变化量)
-        # 输入：Control_RNA + 融合特征 + 扰动向量 + 细胞系向量
-        input_dim = n_genes + (perturb_dim * 3)
-        
-        self.decoder = nn.Sequential()
-        curr_dim = input_dim
-        for i, h_dim in enumerate(hidden_dims):
-            self.decoder.add_module(f"linear_{i}", nn.Linear(curr_dim, h_dim))
-            self.decoder.add_module(f"norm_{i}", nn.LayerNorm(h_dim))
-            self.decoder.add_module(f"act_{i}", nn.LeakyReLU(0.2))
-            self.decoder.add_module(f"dropout_{i}", nn.Dropout(dropout))
-            curr_dim = h_dim
-            
-        # 最终输出层：输出 2000 维的 Delta 变化量
-        self.decoder.add_module("delta_out", nn.Linear(curr_dim, n_genes))
-        
-    def forward(self, rna_control, perturb, cell_line, drug_feat=None, dose=None):
-        """
-        Args:
-            rna_control: 控制组平均表达谱 [B, 2000]
-            perturb: 扰动基因 ID [B] (如果是药物任务，此参数可能为 None 或 dummy)
-            cell_line: 细胞系 ID [B]
-            drug_feat: 药物特征向量 [B, 2048] (可选)
-            dose: 剂量强度 [B] (可选, 0-1之间)
-        Returns:
-            rna_predicted: 预测的扰动后表达谱 [B, 2000]
-        """
-        # 兼容性处理: 如果 rna_control 是 [B, 1, G], squeeze 掉中间维度
-        if rna_control.dim() == 3 and rna_control.shape[1] == 1:
-            rna_control = rna_control.squeeze(1)
-            
-        # 获取基础特征 (双模态切换)
+
+        # ===== 2) Control RNA tokenization =====
+        # [B, G] -> [B, T, d_model] via learned linear tokenizer.
+        self.ctrl_tokenizer = nn.Linear(n_genes, n_ctrl_tokens * d_model)
+
+        # Condition projections to d_model
+        self.perturb_to_dmodel = nn.Sequential(
+            nn.Linear(perturb_dim, d_model),
+            nn.LayerNorm(d_model)
+        )
+        self.cell_to_dmodel = nn.Sequential(
+            nn.Linear(perturb_dim, d_model),
+            nn.LayerNorm(d_model)
+        )
+        self.dose_to_dmodel = nn.Sequential(
+            nn.Linear(perturb_dim, d_model),
+            nn.LayerNorm(d_model)
+        )
+
+        # Learned special tokens + positional embeddings
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        max_seq_len = n_ctrl_tokens + 4  # CLS + ctrl_tokens + pert + cell + dose
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_ff,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.final_norm = nn.LayerNorm(d_model)
+
+        # ===== 3) Delta decoder =====
+        # Use CLS summary + mean ctrl token summary to predict delta.
+        decoder_in = d_model * 2
+        layers = []
+        curr = decoder_in
+        for h_dim in hidden_dims:
+            layers += [
+                nn.Linear(curr, h_dim),
+                nn.LayerNorm(h_dim),
+                nn.LeakyReLU(0.2),
+                nn.Dropout(dropout),
+            ]
+            curr = h_dim
+        layers.append(nn.Linear(curr, n_genes))
+        self.delta_head = nn.Sequential(*layers)
+
+    def _build_perturb_feature(self, perturb, drug_feat=None, dose=None):
         if drug_feat is not None:
-            # 药物模式: 使用 Drug Projector
-            p_emb = self.drug_projection(drug_feat)
-            
-            # --- 核心: 剂量调制 ---
+            p_feat = self.drug_projection(drug_feat)
             if dose is not None:
-                # dose: [B] -> [B, 1]
                 if dose.dim() == 1:
                     dose = dose.unsqueeze(1)
-                
-                # 计算缩放因子 (0.0 - 2.0)
-                # 逻辑: 
-                # 1. 基础缩放: dose_scaler 输出 (0, 1)
-                # 2. 强度调整: * 2.0 允许放大
-                # 3. 零点约束: 如果 dose=0 (Control), 强制 scale=0 (物理约束)
                 scale = self.dose_scaler(dose) * 2.0
-                
-                # 物理约束: Control (dose=0) 时不应有扰动效果
-                # 虽然 ReLU(Linear) 理论上可以学到，但显式乘上 dose 更稳健
-                # p_emb = p_emb * scale * dose  <-- 这种太强硬，可能导致梯度消失
-                
-                # 采用柔性调制: p_emb * scale
-                # 由于 dose 已经在 scaler 输入里了，网络会学到 dose=0 -> scale=0
-                p_emb = p_emb * scale
-                
-        else:
-            # 基因模式: 语义编码优先，fallback 到 ID embedding
-            if self.use_semantic_perturb:
-                p_raw = self.perturb_feature_bank[perturb]
-                p_emb = self.perturb_encoder(p_raw)
-            else:
-                p_emb = self.perturb_embedding(perturb)
-            
+                p_feat = p_feat * scale
+            return p_feat
+
+        if self.use_semantic_perturb:
+            p_raw = self.perturb_feature_bank[perturb]
+            return self.perturb_encoder(p_raw)
+        return self.perturb_embedding(perturb)
+
+    def forward(self, rna_control, perturb, cell_line, drug_feat=None, dose=None):
+        if rna_control.dim() == 3 and rna_control.shape[1] == 1:
+            rna_control = rna_control.squeeze(1)
+
+        bsz = rna_control.size(0)
+
+        # Condition features
+        p_feat = self._build_perturb_feature(perturb, drug_feat=drug_feat, dose=dose)
         c_emb = self.cell_line_embedding(cell_line)
-        
-        # 投影与融合
-        rna_feat = self.rna_projection(rna_control)
         c_feat = self.cell_line_projection(c_emb)
-        
-        tokens = torch.stack([rna_feat, p_emb, c_feat], dim=1)
-        attn_out, _ = self.feature_fusion(tokens, tokens, tokens)
-        fused_feat = attn_out.mean(dim=1)
-        
-        # 拼接特征
-        combined = torch.cat([rna_control, fused_feat, p_emb, c_feat], dim=1)
-        
-        # 预测 Delta (残差变化)
-        delta = self.decoder(combined)
-        
-        # 残差相加: Predicted = Control + Delta
+
+        if dose is None:
+            dose = torch.zeros((bsz, 1), device=rna_control.device, dtype=rna_control.dtype)
+        elif dose.dim() == 1:
+            dose = dose.unsqueeze(1)
+        dose_feat = self.dose_scaler(dose)
+
+        # Control tokens
+        ctrl_tokens = self.ctrl_tokenizer(rna_control).view(bsz, self.n_ctrl_tokens, self.d_model)
+        p_token = self.perturb_to_dmodel(p_feat).unsqueeze(1)
+        c_token = self.cell_to_dmodel(c_feat).unsqueeze(1)
+        d_token = self.dose_to_dmodel(dose_feat).unsqueeze(1)
+        cls_token = self.cls_token.expand(bsz, -1, -1)
+
+        seq = torch.cat([cls_token, ctrl_tokens, p_token, c_token, d_token], dim=1)
+        seq = seq + self.pos_embed[:, :seq.size(1), :]
+
+        h = self.transformer(seq)
+        h = self.final_norm(h)
+
+        cls_h = h[:, 0, :]
+        ctrl_h = h[:, 1:1 + self.n_ctrl_tokens, :].mean(dim=1)
+        fused = torch.cat([cls_h, ctrl_h], dim=1)
+
+        delta = self.delta_head(fused)
         rna_predicted = rna_control + delta
-        
         return rna_predicted
 
     def freeze_perturbation_embedding(self, freeze=True):
-        """控制 Embedding 层的更新，用于训练初期的稳定性"""
+        """Keep compatibility with training script."""
         if self.use_semantic_perturb:
-            # 语义模式下主要训练 perturb_encoder；ID embedding 不是主干
+            # Semantic mode trains perturb_encoder instead of raw ID embedding.
             return
         self.perturb_embedding.weight.requires_grad = not freeze
         state = "冻结" if freeze else "解冻"

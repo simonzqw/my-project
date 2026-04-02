@@ -139,6 +139,11 @@ def get_args():
     parser.add_argument('--drug_dim', type=int, default=2048, help='Morgan Fingerprint dimension')
     parser.add_argument('--hidden_dims', type=int, nargs='+', default=[512, 1024, 2048])
     parser.add_argument('--dropout', type=float, default=0.2)
+    parser.add_argument('--d_model', type=int, default=256)
+    parser.add_argument('--nhead', type=int, default=8)
+    parser.add_argument('--num_layers', type=int, default=4)
+    parser.add_argument('--dim_ff', type=int, default=1024)
+    parser.add_argument('--n_ctrl_tokens', type=int, default=8)
     return parser.parse_args()
 
 def _safe_pearson(x, y):
@@ -247,7 +252,12 @@ def train():
         cell_line_dim=args.cell_line_dim,
         drug_dim=args.drug_dim, # 新增药物维度参数
         hidden_dims=args.hidden_dims,
-        dropout=args.dropout
+        dropout=args.dropout,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_layers=args.num_layers,
+        dim_ff=args.dim_ff,
+        n_ctrl_tokens=args.n_ctrl_tokens
     ).to(device)
 
     # 损失函数: 加权 MSE (根据 Delta 绝对值加权，抑制基线红利)
