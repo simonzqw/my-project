@@ -58,6 +58,9 @@ def get_args():
     parser.add_argument('--cell_line_dim', type=int, default=32)
     parser.add_argument('--hidden_dims', type=int, nargs='+', default=[512, 512, 512]) # 默认参数同步简化
     parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--dose_dim', type=int, default=32)
+    parser.add_argument('--time_dim', type=int, default=128)
+    parser.add_argument('--val_sample_batches', type=int, default=5, help='Number of val batches for sampling metrics')
     
     return parser.parse_args()
 
@@ -135,7 +138,9 @@ def train():
         cell_line_dim=args.cell_line_dim,
         hidden_dims=args.hidden_dims,
         dropout=args.dropout,
-        timesteps=args.timesteps
+        timesteps=args.timesteps,
+        dose_dim=args.dose_dim,
+        time_dim=args.time_dim
     ).to(device)
 
     # 优化器
@@ -158,9 +163,10 @@ def train():
             target_rna = batch['rna_target'].to(device)
             perturb = batch['perturb'].to(device)
             cell_line = batch['cell_line'].to(device)
+            dose = batch['dose'].to(device)
             
             # Forward pass 计算 Diffusion Loss (MSE of Noise Prediction)
-            loss = model(ctrl_rna, perturb, cell_line, target_rna)
+            loss = model(ctrl_rna, perturb, cell_line, target_rna, dose=dose)
             
             (loss / args.accum_steps).backward()
             
@@ -188,29 +194,41 @@ def train():
                 target = batch['rna_target'].to(device)
                 perturb = batch['perturb'].to(device)
                 cell_line = batch['cell_line'].to(device)
-                loss = model(ctrl, perturb, cell_line, target)
+                dose = batch['dose'].to(device)
+                loss = model(ctrl, perturb, cell_line, target, dose=dose)
                 val_loss += loss.item()
         
         # 采样评估 (只取第一个 batch 做快速指标参考)
         with torch.no_grad():
-            first_batch = next(iter(val_loader))
-            ctrl = first_batch['rna_control'].to(device)
-            target = first_batch['rna_target'].to(device)
-            perturb = first_batch['perturb'].to(device)
-            cell_line = first_batch['cell_line'].to(device)
-            
-            # Diffusion 采样生成预测值
-            generated_rna = model.sample(ctrl, perturb, cell_line)
-            
-            # 计算指标
-            batch_m = calculate_metrics(generated_rna, target, ctrl)
-            val_metrics.append(batch_m)
+            for i, batch in enumerate(val_loader):
+                if i >= args.val_sample_batches:
+                    break
+                ctrl = batch['rna_control'].to(device)
+                target = batch['rna_target'].to(device)
+                perturb = batch['perturb'].to(device)
+                cell_line = batch['cell_line'].to(device)
+                dose = batch['dose'].to(device)
+
+                # Diffusion 采样生成预测值
+                generated_rna = model.sample(ctrl, perturb, cell_line, dose=dose)
+
+                # 计算指标
+                batch_m = calculate_metrics(generated_rna, target, ctrl)
+                val_metrics.append(batch_m)
 
         avg_val_loss = val_loss / len(val_loader)
-        final_m = val_metrics[0] # 仅参考第一个 batch
-        
+        if val_metrics:
+            final_m = {
+                'global_r': float(np.mean([m['global_r'] for m in val_metrics])),
+                'delta_r': float(np.mean([m['delta_r'] for m in val_metrics])),
+                'top_n_r': float(np.mean([m['top_n_r'] for m in val_metrics])),
+                'top_n_recall': float(np.mean([m['top_n_recall'] for m in val_metrics]))
+            }
+        else:
+            final_m = {'global_r': 0.0, 'delta_r': 0.0, 'top_n_r': 0.0, 'top_n_recall': 0.0}
+
         print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-        print(f"   >> Val Metrics (Batch 0): Top50 R: {final_m['top_n_r']:.4f} | Delta R: {final_m['delta_r']:.4f}")
+        print(f"   >> Val Metrics (Mean of {min(args.val_sample_batches, len(val_loader))} batches): Top50 R: {final_m['top_n_r']:.4f} | Delta R: {final_m['delta_r']:.4f}")
         
         scheduler.step()
         
