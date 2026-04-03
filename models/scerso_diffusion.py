@@ -21,10 +21,17 @@ class DiffusionDecoder(nn.Module):
     """
     MLP that predicts x0 given x_t, t, and context.
     """
-    def __init__(self, input_dim, context_dim, hidden_dims=[512, 512, 512], dropout=0.1): # 简化网络
+    def __init__(
+        self,
+        input_dim,
+        context_dim,
+        hidden_dims=[512, 512, 512],
+        dropout=0.1,
+        time_dim=128
+    ):  # 简化网络
         super().__init__()
         self.input_dim = input_dim
-        self.time_dim = context_dim 
+        self.time_dim = time_dim
         
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(self.time_dim),
@@ -76,16 +83,17 @@ class PerturbationDiffusionPredictor(nn.Module):
     - Supports Multi-Gene Perturbation (via variable length Attention tokens).
     - Uses Diffusion for high-quality distribution modeling.
     """
-    def __init__(self, n_genes, n_perturbations, n_cell_lines, 
+    def __init__(self, n_genes, n_perturbations, n_cell_lines,
                  pretrained_weights=None,
-                 perturb_dim=200, cell_line_dim=32, 
+                 perturb_dim=200, cell_line_dim=32,
                  hidden_dims=[512, 1024, 2048], dropout=0.1,
-                 timesteps=1000):
+                 timesteps=1000, dose_dim=32, time_dim=128):
         super().__init__()
         
         self.n_genes = n_genes
         self.perturb_dim = perturb_dim
         self.cell_line_dim = cell_line_dim
+        self.dose_dim = dose_dim
         
         # --- 1. Encoder Components (Same as V7/V9 MLP) ---
         if pretrained_weights is not None:
@@ -105,6 +113,12 @@ class PerturbationDiffusionPredictor(nn.Module):
             nn.LayerNorm(perturb_dim)
         )
         self.cell_line_projection = nn.Linear(cell_line_dim, perturb_dim)
+        self.dose_projection = nn.Sequential(
+            nn.Linear(1, dose_dim),
+            nn.SiLU(),
+            nn.Linear(dose_dim, dose_dim),
+            nn.LayerNorm(dose_dim)
+        )
         
         # Attention Fusion
         self.feature_fusion = nn.MultiheadAttention(embed_dim=perturb_dim, num_heads=4, batch_first=True)
@@ -112,13 +126,14 @@ class PerturbationDiffusionPredictor(nn.Module):
         # --- 2. Diffusion Components ---
         # Context dim = RNA_control (n_genes) + Fused_Attention (perturb_dim) + Cell_Emb (perturb_dim)
         # Note: We pass raw RNA_control as part of context to guide the generation
-        self.context_dim = n_genes + perturb_dim * 2
+        self.context_dim = n_genes + perturb_dim * 2 + dose_dim
         
         self.denoise_fn = DiffusionDecoder(
             input_dim=n_genes, # Predicting the full expression profile (or delta)
             context_dim=self.context_dim,
             hidden_dims=hidden_dims,
-            dropout=dropout
+            dropout=dropout,
+            time_dim=time_dim
         )
         
         self.diffusion = GaussianDiffusion(
@@ -128,7 +143,7 @@ class PerturbationDiffusionPredictor(nn.Module):
             objective='pred_x0' # 核心修改：预测原始数据 x0，而非噪声 epsilon
         )
 
-    def encode_context(self, rna_control, perturb, cell_line, custom_latent=None):
+    def encode_context(self, rna_control, perturb, cell_line, dose=None, custom_latent=None):
         """
         Generates the conditioning vector for diffusion.
         
@@ -146,6 +161,11 @@ class PerturbationDiffusionPredictor(nn.Module):
         c_emb = self.cell_line_embedding(cell_line)
         c_feat = self.cell_line_projection(c_emb).unsqueeze(1) # [B, 1, D]
         rna_feat = self.rna_projection(rna_control).unsqueeze(1) # [B, 1, D]
+        if dose is None:
+            dose = torch.zeros((batch_size, 1), device=rna_control.device, dtype=rna_control.dtype)
+        elif dose.dim() == 1:
+            dose = dose.unsqueeze(1)
+        dose_feat = self.dose_projection(dose)
         
         if custom_latent is not None:
             # Case 1: Use provided latent directly (e.g. z_A + z_B)
@@ -168,7 +188,7 @@ class PerturbationDiffusionPredictor(nn.Module):
             fused_feat = attn_out.mean(dim=1) # [B, D]
         
         # Construct Context: [RNA_Control, Fused_Feat, Cell_Feat_Squeezed]
-        context = torch.cat([rna_control, fused_feat, c_feat.squeeze(1)], dim=1)
+        context = torch.cat([rna_control, fused_feat, c_feat.squeeze(1), dose_feat], dim=1)
         
         return context
 
@@ -192,11 +212,11 @@ class PerturbationDiffusionPredictor(nn.Module):
         fused_feat = attn_out.mean(dim=1) # [B, D]
         return fused_feat
 
-    def forward(self, rna_control, perturb, cell_line, target_rna=None):
+    def forward(self, rna_control, perturb, cell_line, target_rna=None, dose=None):
         """
         Training forward pass: Calculates diffusion loss.
         """
-        context = self.encode_context(rna_control, perturb, cell_line)
+        context = self.encode_context(rna_control, perturb, cell_line, dose=dose)
         
         # If target is provided, calculate loss
         if target_rna is not None:
@@ -207,11 +227,17 @@ class PerturbationDiffusionPredictor(nn.Module):
             return None
 
     @torch.no_grad()
-    def sample(self, rna_control, perturb, cell_line, custom_latent=None):
+    def sample(self, rna_control, perturb, cell_line, dose=None, custom_latent=None):
         """
         Inference: Generate prediction
         Supports custom_latent for combinatorial prediction.
         """
-        context = self.encode_context(rna_control, perturb, cell_line, custom_latent=custom_latent)
+        context = self.encode_context(
+            rna_control,
+            perturb,
+            cell_line,
+            dose=dose,
+            custom_latent=custom_latent
+        )
         generated_rna = self.diffusion.sample(context)
         return generated_rna

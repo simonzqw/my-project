@@ -21,6 +21,9 @@ def get_args():
     parser.add_argument('--val_size', type=float, default=0.1)
     parser.add_argument('--top_n', type=int, default=50, help='Number of top DE genes to consider for ROC')
     parser.add_argument('--heatmap_gene', type=str, default='POLR3K', help='Gene to show in Top-20 bar plot')
+    parser.add_argument('--atac_key', type=str, default=None, help='Optional key in adata.obsm for ATAC features')
+    parser.add_argument('--atac_bank_path', type=str, default=None, help='Path to atac_bank.npz for background mapping')
+    parser.add_argument('--background_key', type=str, default='cell_context', help='obs key used to index atac_bank vectors')
     return parser.parse_args()
 
 def visualize():
@@ -33,6 +36,9 @@ def visualize():
     checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
     model_args = checkpoint['args']
     state_dict = checkpoint['model_state_dict']
+    if 'ema_state_dict' in checkpoint and checkpoint['ema_state_dict'] is not None:
+        print(">>> 检测到 EMA 权重，优先使用 EMA 权重进行可视化评估")
+        state_dict = checkpoint['ema_state_dict']
     
     # 2. 加载数据
     print(f">>> 正在加载数据: {args.data_path}")
@@ -43,22 +49,49 @@ def visualize():
         split_strategy=args.split_strategy
     )
     n_genes, n_perts, n_cls = processor.load_data()
-    _, _, test_loader = processor.prepare_loaders(batch_size=args.batch_size)
+    _, _, test_loader = processor.prepare_loaders(
+        batch_size=args.batch_size,
+        atac_key=args.atac_key,
+        atac_bank_path=args.atac_bank_path,
+        background_key=args.background_key
+    )
     gene_names = processor.adata.var_names.tolist()
     
     # 3. 还原模型 (V9 架构)
+    has_perturb_encoder = any(k.startswith('perturb_encoder.') for k in state_dict.keys())
+    pretrained_weights = state_dict['perturb_feature_bank'] if 'perturb_feature_bank' in state_dict else None
+    perturb_weight_for_shape = state_dict['perturb_embedding.weight'] if 'perturb_embedding.weight' in state_dict else None
+    if pretrained_weights is None and has_perturb_encoder and perturb_weight_for_shape is not None:
+        pretrained_weights = perturb_weight_for_shape.detach().clone()
+    missing_feature_bank_in_ckpt = has_perturb_encoder and ('perturb_feature_bank' not in state_dict)
+    atac_dim = getattr(model_args, 'atac_dim', None)
+    if (atac_dim is None or atac_dim == 0) and 'atac_encoder.0.weight' in state_dict:
+        atac_dim = int(state_dict['atac_encoder.0.weight'].shape[1])
+    if atac_dim is None:
+        atac_dim = 0
+    perturb_dim = int(perturb_weight_for_shape.shape[1]) if perturb_weight_for_shape is not None else int(pretrained_weights.shape[1])
+    n_perturbations = int(perturb_weight_for_shape.shape[0]) if perturb_weight_for_shape is not None else int(pretrained_weights.shape[0])
+
     model = PerturbationPredictor(
         n_genes=n_genes,
-        n_perturbations=state_dict['perturb_embedding.weight'].shape[0],
+        n_perturbations=n_perturbations,
         n_cell_lines=state_dict['cell_line_embedding.weight'].shape[0],
-        perturb_dim=state_dict['perturb_embedding.weight'].shape[1],
+        pretrained_weights=pretrained_weights,
+        perturb_dim=perturb_dim,
         cell_line_dim=state_dict['cell_line_embedding.weight'].shape[1],
         drug_dim=getattr(model_args, 'drug_dim', 2048),
-        hidden_dims=[512, 1024, 2048],
-        dropout=getattr(model_args, 'dropout', 0.2)
+        hidden_dims=getattr(model_args, 'hidden_dims', [512, 1024, 2048]),
+        dropout=getattr(model_args, 'dropout', 0.2),
+        d_model=getattr(model_args, 'd_model', 256),
+        nhead=getattr(model_args, 'nhead', 8),
+        num_layers=getattr(model_args, 'num_layers', 4),
+        dim_ff=getattr(model_args, 'dim_ff', 1024),
+        n_ctrl_tokens=getattr(model_args, 'n_ctrl_tokens', 8),
+        atac_dim=atac_dim
     ).to(device)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=not missing_feature_bank_in_ckpt)
     model.eval()
+    drug_embeddings = processor.drug_embeddings.to(device) if processor.drug_embeddings is not None else None
     
     # 4. 执行推理并按扰动分组
     results_by_pert = {} # {pert_name: {preds: [], targets: [], ctrls: []}}
@@ -73,12 +106,13 @@ def visualize():
             perturb = batch['perturb'].to(device)
             cell_line = batch['cell_line'].to(device)
             dose = batch['dose'].to(device) if 'dose' in batch else None
+            atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
             
             drug_feat = None
-            if processor.drug_embeddings is not None:
-                drug_feat = processor.drug_embeddings[perturb].to(device)
+            if drug_embeddings is not None:
+                drug_feat = drug_embeddings[perturb]
             
-            res = model(ctrl, perturb, cell_line, drug_feat=drug_feat, dose=dose)
+            res = model(ctrl, perturb, cell_line, drug_feat=drug_feat, dose=dose, atac_feat=atac_feat)
             
             res_np = res.cpu().numpy()
             target_np = target.cpu().numpy()
@@ -111,7 +145,8 @@ def visualize():
         d_t = avg_t - avg_c
         
         # ROC AUC
-        top_idx = np.argsort(np.abs(d_t))[-args.top_n:]
+        top_n = min(args.top_n, len(d_t))
+        top_idx = np.argsort(np.abs(d_t))[-top_n:]
         binary_labels = np.zeros_like(d_t)
         binary_labels[top_idx] = 1
         fpr, tpr, _ = roc_curve(binary_labels, np.abs(d_p))
@@ -171,9 +206,10 @@ def visualize():
 
     # 保存测试集基因列表
     test_genes_list = sorted(df_pert['perturb'].tolist())
-    with open("test_genes_list.txt", "w") as f:
+    test_genes_path = os.path.join(os.path.dirname(args.save_path) or ".", "test_genes_list.txt")
+    with open(test_genes_path, "w") as f:
         f.write("\n".join(test_genes_list))
-    print(f">>> 已将 {len(test_genes_list)} 个测试集基因保存至: test_genes_list.txt")
+    print(f">>> 已将 {len(test_genes_list)} 个测试集基因保存至: {test_genes_path}")
 
     # 如果没找到指定的基因，自动选择测试集中 AUC 最高的基因作为备份
     if bar_plot_data is None:
