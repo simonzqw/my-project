@@ -144,6 +144,9 @@ def get_args():
     parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--dim_ff', type=int, default=1024)
     parser.add_argument('--n_ctrl_tokens', type=int, default=8)
+    parser.add_argument('--atac_key', type=str, default=None, help='Key in adata.obsm for ATAC features (e.g., X_atac)')
+    parser.add_argument('--atac_bank_path', type=str, default=None, help='Path to atac_bank.npz for background mapping')
+    parser.add_argument('--background_key', type=str, default='cell_context', help='obs key used to index atac_bank vectors')
     return parser.parse_args()
 
 def _safe_pearson(x, y):
@@ -230,8 +233,13 @@ def train():
     train_loader, val_loader, test_loader = processor.prepare_loaders(
         batch_size=args.batch_size,
         rna_noise=args.noise,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        atac_key=args.atac_key,
+        atac_bank_path=args.atac_bank_path,
+        background_key=args.background_key
     )
+    atac_dim = processor.atac_features.shape[1] if getattr(processor, 'atac_features', None) is not None else 0
+    args.atac_dim = int(atac_dim)
     
     # 2. 加载预训练向量
     pretrained_weights = None
@@ -257,7 +265,8 @@ def train():
         nhead=args.nhead,
         num_layers=args.num_layers,
         dim_ff=args.dim_ff,
-        n_ctrl_tokens=args.n_ctrl_tokens
+        n_ctrl_tokens=args.n_ctrl_tokens,
+        atac_dim=atac_dim
     ).to(device)
 
     # 损失函数: 加权 MSE (根据 Delta 绝对值加权，抑制基线红利)
@@ -335,6 +344,7 @@ def train():
             perturb = batch['perturb'].to(device)
             cell_line = batch['cell_line'].to(device)
             dose = batch['dose'].to(device) if 'dose' in batch else None
+            atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
             is_control = (perturb == control_id) if control_id is not None else None
             
             # 药物特征处理 (如果有)
@@ -345,7 +355,7 @@ def train():
             
             # 传递 drug_feat 和 dose 到 forward
             with torch.cuda.amp.autocast(enabled=(args.amp and device.type == "cuda")):
-                outputs = model(ctrl_rna, perturb, cell_line, drug_feat=drug_feat, dose=dose)
+                outputs = model(ctrl_rna, perturb, cell_line, drug_feat=drug_feat, dose=dose, atac_feat=atac_feat)
                 
                 # 使用加权损失
                 loss = criterion(outputs, target_rna, ctrl_rna, is_control=is_control)
@@ -382,6 +392,7 @@ def train():
                 perturb = batch['perturb'].to(device)
                 cell_line = batch['cell_line'].to(device)
                 dose = batch['dose'].to(device) if 'dose' in batch else None
+                atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
                 is_control = (perturb == control_id) if control_id is not None else None
                 
                 # 药物特征处理 (验证集)
@@ -389,7 +400,7 @@ def train():
                 if drug_embeddings is not None:
                     drug_feat = drug_embeddings[perturb]
                 
-                outputs = model(ctrl, perturb, cell_line, drug_feat=drug_feat, dose=dose)
+                outputs = model(ctrl, perturb, cell_line, drug_feat=drug_feat, dose=dose, atac_feat=atac_feat)
                 
                 loss = criterion(outputs, target, ctrl, is_control=is_control)
                 val_loss += loss.item()
@@ -472,13 +483,14 @@ def train():
             perturb = batch['perturb'].to(device)
             cell_line = batch['cell_line'].to(device)
             dose = batch['dose'].to(device) if 'dose' in batch else None
+            atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
             
             # 药物特征处理 (测试集)
             drug_feat = None
             if drug_embeddings is not None:
                 drug_feat = drug_embeddings[perturb]
             
-            outputs = model(ctrl, perturb, cell_line, drug_feat=drug_feat, dose=dose)
+            outputs = model(ctrl, perturb, cell_line, drug_feat=drug_feat, dose=dose, atac_feat=atac_feat)
             m = calculate_metrics(outputs.cpu().numpy(), target.cpu().numpy(), ctrl.cpu().numpy())
             test_metrics.append(m)
     

@@ -225,6 +225,9 @@ def get_args():
     parser.add_argument('--de_mode', type=str, default='threshold', choices=['threshold', 'topk', 'quantile'])
     parser.add_argument('--de_topk', type=int, default=200, help='DE topK when de_mode=topk')
     parser.add_argument('--de_quantile', type=float, default=0.9, help='DE quantile when de_mode=quantile')
+    parser.add_argument('--atac_key', type=str, default=None, help='Optional key in adata.obsm for ATAC features')
+    parser.add_argument('--atac_bank_path', type=str, default=None, help='Path to atac_bank.npz for background mapping')
+    parser.add_argument('--background_key', type=str, default='cell_context', help='obs key used to index atac_bank vectors')
     return parser.parse_args()
 
 
@@ -239,7 +242,14 @@ def main():
         split_strategy=args.split_strategy
     )
     n_genes, n_perts, n_cell_lines = processor.load_data()
-    _, _, test_loader = processor.prepare_loaders(batch_size=args.batch_size, num_workers=args.num_workers, rna_noise=0.0)
+    _, _, test_loader = processor.prepare_loaders(
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        rna_noise=0.0,
+        atac_key=args.atac_key,
+        atac_bank_path=args.atac_bank_path,
+        background_key=args.background_key
+    )
 
     ckpt = torch.load(args.model_path, map_location=device, weights_only=False)
     state_dict = ckpt['ema_state_dict'] if (args.use_ema and ('ema_state_dict' in ckpt) and ckpt['ema_state_dict'] is not None) else ckpt['model_state_dict']
@@ -252,6 +262,11 @@ def main():
     if pretrained_weights is None and has_perturb_encoder and perturb_weight_for_shape is not None:
         pretrained_weights = perturb_weight_for_shape.detach().clone()
     missing_feature_bank_in_ckpt = has_perturb_encoder and ('perturb_feature_bank' not in state_dict)
+    atac_dim = getattr(model_args, 'atac_dim', None)
+    if (atac_dim is None or atac_dim == 0) and 'atac_encoder.0.weight' in state_dict:
+        atac_dim = int(state_dict['atac_encoder.0.weight'].shape[1])
+    if atac_dim is None:
+        atac_dim = 0
 
     perturb_dim = int(perturb_weight_for_shape.shape[1]) if perturb_weight_for_shape is not None else int(pretrained_weights.shape[1])
     n_perturbations = int(perturb_weight_for_shape.shape[0]) if perturb_weight_for_shape is not None else int(pretrained_weights.shape[0])
@@ -270,7 +285,8 @@ def main():
         nhead=getattr(model_args, 'nhead', 8),
         num_layers=getattr(model_args, 'num_layers', 4),
         dim_ff=getattr(model_args, 'dim_ff', 1024),
-        n_ctrl_tokens=getattr(model_args, 'n_ctrl_tokens', 8)
+        n_ctrl_tokens=getattr(model_args, 'n_ctrl_tokens', 8),
+        atac_dim=atac_dim
     ).to(device)
     model.load_state_dict(state_dict, strict=not missing_feature_bank_in_ckpt)
     model.eval()
@@ -286,10 +302,11 @@ def main():
             perturb = batch['perturb'].to(device)
             cell_line = batch['cell_line'].to(device)
             dose = batch['dose'].to(device) if 'dose' in batch else None
+            atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
             perturb_ids = batch['perturb'].cpu().numpy()
 
             drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
-            pred = model(ctrl, perturb, cell_line, drug_feat=drug_feat, dose=dose)
+            pred = model(ctrl, perturb, cell_line, drug_feat=drug_feat, dose=dose, atac_feat=atac_feat)
 
             pred_np = pred.cpu().numpy()
             target_np = target.cpu().numpy()

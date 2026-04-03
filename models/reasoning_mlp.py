@@ -26,7 +26,8 @@ class PerturbationPredictor(nn.Module):
         nhead=8,
         num_layers=4,
         dim_ff=1024,
-        n_ctrl_tokens=8
+        n_ctrl_tokens=8,
+        atac_dim=0
     ):
         super(PerturbationPredictor, self).__init__()
         self.n_genes = n_genes
@@ -34,6 +35,7 @@ class PerturbationPredictor(nn.Module):
         self.use_semantic_perturb = pretrained_weights is not None
         self.n_ctrl_tokens = n_ctrl_tokens
         self.d_model = d_model
+        self.atac_dim = atac_dim
 
         # ===== 1) Perturbation branch =====
         self.perturb_embedding = nn.Embedding(n_perturbations, perturb_dim)
@@ -90,10 +92,29 @@ class PerturbationPredictor(nn.Module):
             nn.Linear(perturb_dim, d_model),
             nn.LayerNorm(d_model)
         )
+        if atac_dim is not None and atac_dim > 0:
+            self.atac_encoder = nn.Sequential(
+                nn.Linear(atac_dim, 512),
+                nn.LayerNorm(512),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(512, perturb_dim),
+                nn.LayerNorm(perturb_dim)
+            )
+            self.atac_to_dmodel = nn.Sequential(
+                nn.Linear(perturb_dim, d_model),
+                nn.LayerNorm(d_model)
+            )
+            self.use_atac = True
+        else:
+            self.atac_encoder = None
+            self.atac_to_dmodel = None
+            self.use_atac = False
+        self.null_atac_token = nn.Parameter(torch.zeros(1, 1, d_model))
 
         # Learned special tokens + positional embeddings
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        max_seq_len = n_ctrl_tokens + 4  # CLS + ctrl_tokens + pert + cell + dose
+        max_seq_len = n_ctrl_tokens + 5  # CLS + ctrl_tokens + pert + cell + dose + atac
         self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -139,7 +160,7 @@ class PerturbationPredictor(nn.Module):
             return self.perturb_encoder(p_raw)
         return self.perturb_embedding(perturb)
 
-    def forward(self, rna_control, perturb, cell_line, drug_feat=None, dose=None):
+    def forward(self, rna_control, perturb, cell_line, drug_feat=None, dose=None, atac_feat=None):
         if rna_control.dim() == 3 and rna_control.shape[1] == 1:
             rna_control = rna_control.squeeze(1)
 
@@ -155,6 +176,11 @@ class PerturbationPredictor(nn.Module):
         elif dose.dim() == 1:
             dose = dose.unsqueeze(1)
         dose_feat = self.dose_scaler(dose)
+        if self.use_atac and atac_feat is not None:
+            atac_latent = self.atac_encoder(atac_feat)
+            atac_token = self.atac_to_dmodel(atac_latent).unsqueeze(1)
+        else:
+            atac_token = self.null_atac_token.expand(bsz, -1, -1)
 
         # Control tokens
         ctrl_tokens = self.ctrl_tokenizer(rna_control).view(bsz, self.n_ctrl_tokens, self.d_model)
@@ -163,7 +189,7 @@ class PerturbationPredictor(nn.Module):
         d_token = self.dose_to_dmodel(dose_feat).unsqueeze(1)
         cls_token = self.cls_token.expand(bsz, -1, -1)
 
-        seq = torch.cat([cls_token, ctrl_tokens, p_token, c_token, d_token], dim=1)
+        seq = torch.cat([cls_token, ctrl_tokens, p_token, c_token, d_token, atac_token], dim=1)
         seq = seq + self.pos_embed[:, :seq.size(1), :]
 
         h = self.transformer(seq)

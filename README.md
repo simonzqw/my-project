@@ -15,6 +15,7 @@
 - `evaluate_metrics.py`：离线评估脚本，输出 single-cell 与 perturbation-level 指标 JSON。
 - `visualize.py`：测试集可视化与报告图生成。
 - `train_diffusion.py`：Diffusion 分支训练脚本（可选方向，非当前主线）。
+- `build_atac_bank.py`：从 K562/RPE1 peaks 构建与 h5ad 基因顺序对齐的 `atac_bank.npz`。
 - `models/reasoning_mlp.py`：当前主模型 `PerturbationPredictor`（Transformer 主体）。
 - `models/scerso_diffusion.py`：Diffusion 模型定义。
 - `utils/data_processor.py`：h5ad 数据读取、划分、control 采样、dose 处理。
@@ -40,6 +41,9 @@
 - 细胞背景：`cell_line`（或 `source_batch`）
 - 剂量（可选）：`dose`
 - 药物特征（可选）：`smiles`
+- ATAC（可选）：
+  - 方式A：`adata.obsm['X_atac'/'atac'/'atac_feat']`
+  - 方式B：外部 `atac_bank.npz` + `obs[background_key]` 映射（见第 8 节）
 
 ---
 
@@ -93,6 +97,12 @@ python train.py \
   --resume_path "./checkpoints_adamson_tf/latest.pth"
 ```
 
+若使用外部 ATAC bank，可额外加：
+```bash
+--atac_bank_path "/path/to/atac_bank.npz" \
+--background_key "cell_context"
+```
+
 ---
 
 ## 4. 评估（推荐）
@@ -109,7 +119,9 @@ python evaluate_metrics.py \
   --use_ema \
   --de_mode quantile \
   --de_quantile 0.9 \
-  --output_json "./checkpoints_adamson_tf/test_metrics_q90.json"
+  --output_json "./checkpoints_adamson_tf/test_metrics_q90.json" \
+  --atac_bank_path "/path/to/atac_bank.npz" \
+  --background_key "cell_context"
 ```
 
 `evaluate_metrics.py` 当前会同时输出：
@@ -132,7 +144,9 @@ python visualize.py \
   --split_strategy perturbation \
   --batch_size 512 \
   --top_n 50 \
-  --heatmap_gene "POLR3K"
+  --heatmap_gene "POLR3K" \
+  --atac_bank_path "/path/to/atac_bank.npz" \
+  --background_key "cell_context"
 ```
 
 输出：
@@ -158,3 +172,21 @@ export OMP_NUM_THREADS=1
 
 ### Q2: 为什么 `visualize.py` 的 Pearson 往往比 `evaluate_metrics.py` 高？
 `visualize.py` 使用的是按 perturbation 聚合均值后的报告口径；`evaluate_metrics.py` 的 single-cell 指标更严格，数值通常更低但更接近真实单细胞预测难度。
+
+---
+
+## 8. 构建 ATAC bank（K562/RPE1 示例）
+
+```bash
+python build_atac_bank.py \
+  --h5ad_path /path/to/adata_final_2000hvgs.h5ad \
+  --gtf_path /path/to/gencode_human_grch38.gtf.gz \
+  --k562_bigbed atac_downloads/K562_ENCFF691QRB.bigBed \
+  --rpe1_bigbed atac_downloads/RPE1_4DNFIMNHSGU1.bb \
+  --out_dir ./atac_bank_out \
+  --mode binary
+```
+
+输出：
+- `atac_bank_out/atac_bank.npz`
+- `atac_bank_out/atac_bank_meta.json`
