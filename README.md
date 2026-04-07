@@ -157,8 +157,26 @@ python visualize.py \
 
 ## 6. Diffusion 分支（可选）
 
-`train_diffusion.py` 已支持 `dose_dim/time_dim` 与 dose 条件输入。  
-该分支目前用于研究探索，不作为默认主训练路径。
+`train_diffusion.py` 已扩展为更接近 Squidiff 风格的条件扩散训练流程，新增：
+- 条件融合增强：支持 `dose + ATAC + drug embedding` 作为上下文条件；
+- 训练策略增强：支持 `uniform / loss-second-moment` 时间步采样；
+- 采样策略增强：支持 DDIM 快速采样（`--sample_steps`）与 classifier-free guidance（`--guidance_scale` + `--cond_dropout`）；
+- 工程能力增强：支持 AMP、EMA、`latest.pth` 断点续训、按 epoch 轮转保存。
+
+示例：
+```bash
+python train_diffusion.py \
+  --data_path /path/to/adata_final_2000hvgs.h5ad \
+  --save_dir ./checkpoints_diff \
+  --split_strategy perturbation \
+  --timesteps 1000 \
+  --sample_steps 50 \
+  --timestep_sampler loss-second-moment \
+  --cond_dropout 0.1 \
+  --guidance_scale 1.2 \
+  --atac_bank_path /path/to/atac_bank.npz \
+  --amp
+```
 
 ---
 

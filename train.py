@@ -287,7 +287,9 @@ def train():
     ]
     optimizer = optim.AdamW(param_groups, weight_decay=args.weight_decay)
     main_scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=(args.amp and device.type == "cuda")
+    )
     control_id = processor.perturb_map.get('control', None)
     drug_embeddings = processor.drug_embeddings.to(device) if processor.drug_embeddings is not None else None
     ema = ExponentialMovingAverage(model, decay=args.ema_decay)
@@ -354,7 +356,9 @@ def train():
                 drug_feat = drug_embeddings[perturb]
             
             # 传递 drug_feat 和 dose 到 forward
-            with torch.cuda.amp.autocast(enabled=(args.amp and device.type == "cuda")):
+            with torch.amp.autocast(
+                "cuda", enabled=(args.amp and device.type == "cuda")
+            ):
                 outputs = model(ctrl_rna, perturb, cell_line, drug_feat=drug_feat, dose=dose, atac_feat=atac_feat)
                 
                 # 使用加权损失

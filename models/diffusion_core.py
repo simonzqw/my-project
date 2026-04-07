@@ -75,7 +75,7 @@ class GaussianDiffusion(nn.Module):
         
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
-    def p_losses(self, x_start, t, context, noise=None):
+    def p_losses(self, x_start, t, context, noise=None, weights=None):
         """
         Calculate loss for training
         """
@@ -96,10 +96,20 @@ class GaussianDiffusion(nn.Module):
             raise ValueError(f"Unknown objective: {self.objective}")
 
         # Simple MSE loss
-        loss = F.mse_loss(model_out, target)
+        loss = F.mse_loss(model_out, target, reduction='none').mean(dim=1)
+        if weights is not None:
+            loss = loss * weights
+        loss = loss.mean()
         return loss
 
-    def p_sample(self, x, t, context, t_index):
+    def model_predictions(self, x, t, context, guidance_scale=1.0, uncond_context=None):
+        model_out = self.model(x, t, context)
+        if uncond_context is not None and guidance_scale != 1.0:
+            uncond_out = self.model(x, t, uncond_context)
+            model_out = uncond_out + guidance_scale * (model_out - uncond_out)
+        return model_out
+
+    def p_sample(self, x, t, context, t_index, guidance_scale=1.0, uncond_context=None):
         """
         Sample from the model (reverse process) - Single step
         """
@@ -109,7 +119,9 @@ class GaussianDiffusion(nn.Module):
         
         # We use the equation: x_{t-1} = 1/sqrt(alpha) * (x_t - beta/sqrt(1-alpha_bar) * epsilon) + sigma * z
         # But first, let's get the model prediction (epsilon or x0)
-        model_out = self.model(x, t, context)
+        model_out = self.model_predictions(
+            x, t, context, guidance_scale=guidance_scale, uncond_context=uncond_context
+        )
         
         if self.objective == 'pred_noise':
             pred_noise = model_out
@@ -145,7 +157,36 @@ class GaussianDiffusion(nn.Module):
         return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))
 
     @torch.no_grad()
-    def sample(self, context, batch_size=None):
+    def ddim_sample(self, context, batch_size=None, sampling_timesteps=50, eta=0.0, guidance_scale=1.0, uncond_context=None):
+        if batch_size is None:
+            batch_size = context.shape[0]
+        device = next(self.parameters()).device
+        x = torch.randn((batch_size, self.input_dim), device=device)
+        times = torch.linspace(self.timesteps - 1, 0, steps=sampling_timesteps, device=device).long()
+        for i, t_curr in enumerate(times):
+            t = torch.full((batch_size,), int(t_curr.item()), device=device, dtype=torch.long)
+            model_out = self.model_predictions(
+                x, t, context, guidance_scale=guidance_scale, uncond_context=uncond_context
+            )
+            if self.objective == 'pred_noise':
+                pred_x0 = self.predict_start_from_noise(x, t, model_out)
+            else:
+                pred_x0 = model_out
+            pred_x0 = pred_x0.clamp(-10.0, 10.0)
+            if i == len(times) - 1:
+                x = pred_x0
+                break
+            t_next = torch.full((batch_size,), int(times[i + 1].item()), device=device, dtype=torch.long)
+            alpha = self._extract(self.alphas_cumprod, t, x.shape)
+            alpha_next = self._extract(self.alphas_cumprod, t_next, x.shape)
+            sigma = eta * torch.sqrt((1 - alpha_next) / (1 - alpha) * (1 - alpha / alpha_next))
+            noise = torch.randn_like(x)
+            pred_noise = (x - torch.sqrt(alpha) * pred_x0) / torch.sqrt((1 - alpha).clamp(min=1e-8))
+            x = torch.sqrt(alpha_next) * pred_x0 + torch.sqrt((1 - alpha_next - sigma ** 2).clamp(min=0.0)) * pred_noise + sigma * noise
+        return x
+
+    @torch.no_grad()
+    def sample(self, context, batch_size=None, sampling_timesteps=None, guidance_scale=1.0, uncond_context=None):
         """
         Generate samples from pure noise
         """
@@ -157,8 +198,19 @@ class GaussianDiffusion(nn.Module):
         # Start from pure noise
         img = torch.randn((batch_size, self.input_dim), device=device)
         
+        if sampling_timesteps is not None and sampling_timesteps < self.timesteps:
+            return self.ddim_sample(
+                context,
+                batch_size=batch_size,
+                sampling_timesteps=sampling_timesteps,
+                guidance_scale=guidance_scale,
+                uncond_context=uncond_context,
+            )
+
         for i in reversed(range(0, self.timesteps)):
             t = torch.full((batch_size,), i, device=device, dtype=torch.long)
-            img = self.p_sample(img, t, context, i)
+            img = self.p_sample(
+                img, t, context, i, guidance_scale=guidance_scale, uncond_context=uncond_context
+            )
             
         return img
