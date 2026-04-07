@@ -36,6 +36,7 @@ class GeneEmbeddingLoader:
             n_perturbations = len(self.perturb_map)
             emb_dim = df.shape[1]
             weights = np.random.normal(scale=0.02, size=(n_perturbations, emb_dim))
+            mean_vec = df.values.mean(axis=0)
             
             hit_count = 0
             # 遍历我们数据中的所有扰动 ID
@@ -52,6 +53,8 @@ class GeneEmbeddingLoader:
                 elif gene_name.upper() in df.index:
                     weights[idx] = df.loc[gene_name.upper()].values
                     hit_count += 1
+                else:
+                    weights[idx] = mean_vec
                     
             print(f">>> 预训练向量匹配成功率: {hit_count}/{n_perturbations} ({hit_count/n_perturbations:.1%})")
             return torch.FloatTensor(weights)
