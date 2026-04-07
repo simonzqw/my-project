@@ -176,11 +176,14 @@ def train():
         test_size=args.test_size, 
         val_size=args.val_size, 
         split_strategy=args.split_strategy,
-        atac_key=args.atac_key,
-        atac_bank_path=args.atac_bank_path,
     )
     n_genes, n_perts, n_cell_lines = processor.load_data()
-    train_loader, val_loader, test_loader = processor.prepare_loaders(batch_size=args.batch_size, rna_noise=0.0) # Diffusion 自带加噪，无需额外数据增强
+    train_loader, val_loader, test_loader = processor.prepare_loaders(
+        batch_size=args.batch_size,
+        rna_noise=0.0,
+        atac_key=args.atac_key,
+        atac_bank_path=args.atac_bank_path,
+    ) # Diffusion 自带加噪，无需额外数据增强
     
     # 2. 加载预训练向量
     pretrained_weights = None
