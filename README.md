@@ -161,6 +161,8 @@ python visualize.py \
 - 条件融合增强：支持 `dose + ATAC + drug embedding` 作为上下文条件；
 - 训练策略增强：支持 `uniform / loss-second-moment` 时间步采样；
 - 采样策略增强：支持 DDIM 快速采样（`--sample_steps`）与 classifier-free guidance（`--guidance_scale` + `--cond_dropout`）；
+- 组合扰动增强：`predict_diffusion.py` / `visualize_diffusion.py` 支持 `--latent_mode adaptive`，在加权叠加基础上引入 pairwise 非线性交互与门控融合；
+- 轨迹能力增强：`predict_diffusion.py` 支持 `--interpolate_to` 与 `--interp_steps` 生成 latent interpolation 轨迹；
 - 工程能力增强：支持 AMP、EMA、`latest.pth` 断点续训、按 epoch 轮转保存。
 
 示例：

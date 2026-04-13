@@ -20,9 +20,11 @@ def get_args():
     parser.add_argument('--cell_line', type=str, required=True, help='Cell line name or numeric id')
     parser.add_argument('--perturb_genes', type=str, nargs='+', required=True, help='One gene for single prediction, multiple genes for latent arithmetic')
     parser.add_argument('--weights', type=float, nargs='*', default=None, help='Optional weights for latent arithmetic')
-    parser.add_argument('--latent_mode', type=str, default='sum', choices=['sum', 'mean'])
+    parser.add_argument('--latent_mode', type=str, default='adaptive', choices=['sum', 'mean', 'adaptive'])
     parser.add_argument('--sample_steps', type=int, default=50)
     parser.add_argument('--guidance_scale', type=float, default=1.0)
+    parser.add_argument('--interpolate_to', type=str, default=None, help='Optional target perturb gene for latent interpolation trajectory')
+    parser.add_argument('--interp_steps', type=int, default=8, help='Interpolation steps when --interpolate_to is set')
     parser.add_argument('--atac_key', type=str, default=None)
     parser.add_argument('--atac_bank_path', type=str, default=None)
     parser.add_argument('--background_key', type=str, default='cell_context')
@@ -104,6 +106,8 @@ def main():
     atac_feat = processor.get_cell_line_atac(cell_line_id, device=device)
     if atac_feat is not None:
         atac_feat = atac_feat.unsqueeze(0)
+    if len(args.perturb_genes) > 1 and atac_feat is not None:
+        print(">>> 提示: 组合扰动当前默认复用同一 cell-line baseline ATAC；若组合引发显著染色质变化，建议外部构建组合特异 ATAC 条件。")
 
     latents = []
     perturb_ids = []
@@ -161,6 +165,34 @@ def main():
     }).sort_values('abs_delta', ascending=False)
     df.to_csv(csv_path, index=False)
     np.save(latent_path, latent_used.squeeze(0).detach().cpu().numpy())
+
+    if args.interpolate_to is not None:
+        if args.interpolate_to not in processor.perturb_map:
+            raise ValueError(f"interpolate_to 扰动 {args.interpolate_to} 不在 perturbation 列表中。")
+        pid_to = processor.perturb_map[args.interpolate_to]
+        latent_to = model.get_latent(
+            rna_control=control,
+            perturb=torch.tensor([pid_to], dtype=torch.long, device=device),
+            cell_line=cell_line_tensor,
+            atac_feat=atac_feat,
+        )
+        interp = model.interpolate_latents(latents[0], latent_to, steps=args.interp_steps)
+        traj_preds = []
+        for i in range(interp.shape[0]):
+            p = model.predict_from_latent(
+                rna_control=control,
+                cell_line=cell_line_tensor,
+                latent=interp[i],
+                perturb=torch.tensor([perturb_ids[0]], dtype=torch.long, device=device),
+                atac_feat=atac_feat,
+                sample_steps=args.sample_steps,
+                guidance_scale=args.guidance_scale,
+            )
+            traj_preds.append(p.squeeze(0).detach().cpu().numpy())
+        traj_arr = np.stack(traj_preds, axis=0)
+        traj_path = os.path.join(args.save_dir, f"{prefix}__to__{args.interpolate_to}_trajectory.npy")
+        np.save(traj_path, traj_arr)
+        print(f">>> 插值轨迹保存: {traj_path}")
 
     top_df = df.head(20).iloc[::-1]
     plt.style.use('seaborn-v0_8-whitegrid')
