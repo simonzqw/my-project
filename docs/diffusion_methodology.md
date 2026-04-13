@@ -18,6 +18,7 @@ p(\mathbf{x}_{\text{pert}}\mid \mathbf{x}_{\text{ctrl}},\ \text{perturb},\ \text
 - dose投影；
 - 可选 ATAC / drug 特征投影；
 - 通过多头自注意力融合，再做残差MLP与LayerNorm得到 \(\mathbf{z}_{sem}\)。
+- 并行引入 joint semantic encoder（RNA/perturb/cell-line/dose 拼接后 MLP）并与 attention 路径做门控融合，提升单扰动语义表示稳定性。
 
 随后构造扩散条件向量：
 
@@ -72,6 +73,13 @@ q(\mathbf{x}_t\mid \mathbf{x}_0)=\mathcal{N}\left(\sqrt{\bar\alpha_t}\mathbf{x}_
 
 ### DDIM快速采样
 若 `sample_steps < timesteps`，走DDIM子序列更新，支持 \(\eta\) 控制随机性。
+
+### Latent Interpolation
+支持在两个语义 latent 之间做线性插值轨迹：
+\[
+z(\alpha)=(1-\alpha)z_A+\alpha z_B,\ \alpha\in[0,1]
+\]
+可用于剂量/状态连续过渡分析（`predict_diffusion.py --interpolate_to --interp_steps`）。
 
 ### Classifier-Free Guidance
 同时计算条件/无条件预测并线性组合：

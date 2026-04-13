@@ -221,6 +221,20 @@ class PerturbationDiffusionPredictor(nn.Module):
             nn.Linear(perturb_dim, perturb_dim),
         )
         self.fusion_norm = nn.LayerNorm(perturb_dim)
+        self.semantic_joint_encoder = nn.Sequential(
+            nn.Linear(perturb_dim * 4, perturb_dim),
+            nn.LayerNorm(perturb_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(perturb_dim, perturb_dim),
+            nn.LayerNorm(perturb_dim),
+        )
+        self.semantic_blend_gate = nn.Sequential(
+            nn.Linear(perturb_dim * 2, perturb_dim),
+            nn.SiLU(),
+            nn.Linear(perturb_dim, perturb_dim),
+            nn.Sigmoid(),
+        )
         self.latent_composer = nn.Sequential(
             nn.Linear(perturb_dim * 4, perturb_dim),
             nn.LayerNorm(perturb_dim),
@@ -298,8 +312,11 @@ class PerturbationDiffusionPredictor(nn.Module):
         dose_feat = self.dose_projection(dose).unsqueeze(1)
 
         p_emb = self._perturb_tokens(perturb, dose=dose)
+        p_pooled = p_emb.mean(dim=1)
 
         tokens = [rna_feat, p_emb, c_feat, dose_feat]
+        atac_token = None
+        drug_token = None
 
         if self.atac_projection is not None and atac_feat is not None:
             if atac_feat.dim() == 1:
@@ -317,7 +334,19 @@ class PerturbationDiffusionPredictor(nn.Module):
         attn_out, _ = self.feature_fusion(tokens, tokens, tokens)
         fused_feat = attn_out.mean(dim=1)
         fused_feat = self.fusion_norm(fused_feat + self.fusion_mlp(fused_feat))
-        return fused_feat
+        joint_core = torch.cat(
+            [rna_feat.squeeze(1), p_pooled, c_feat.squeeze(1), dose_feat.squeeze(1)],
+            dim=1,
+        )
+        joint_feat = self.semantic_joint_encoder(joint_core)
+        if atac_token is not None:
+            joint_feat = joint_feat + 0.5 * atac_token.squeeze(1)
+        if drug_token is not None:
+            joint_feat = joint_feat + 0.5 * drug_token.squeeze(1)
+
+        blend_gate = self.semantic_blend_gate(torch.cat([fused_feat, joint_feat], dim=1))
+        z_sem = blend_gate * fused_feat + (1.0 - blend_gate) * joint_feat
+        return z_sem
 
     def encode_context(
         self,
@@ -411,6 +440,17 @@ class PerturbationDiffusionPredictor(nn.Module):
         elif mode != "sum":
             raise ValueError(f"未知组合模式: {mode}")
         return out
+
+    @staticmethod
+    def interpolate_latents(
+        z_start: torch.Tensor,
+        z_end: torch.Tensor,
+        steps: int = 10,
+    ) -> torch.Tensor:
+        if steps < 2:
+            raise ValueError("steps 必须 >= 2。")
+        alphas = torch.linspace(0.0, 1.0, steps=steps, device=z_start.device, dtype=z_start.dtype).view(steps, 1, 1)
+        return (1.0 - alphas) * z_start.unsqueeze(0) + alphas * z_end.unsqueeze(0)
 
     def forward(
         self,
