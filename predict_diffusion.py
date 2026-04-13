@@ -20,7 +20,7 @@ def get_args():
     parser.add_argument('--cell_line', type=str, required=True, help='Cell line name or numeric id')
     parser.add_argument('--perturb_genes', type=str, nargs='+', required=True, help='One gene for single prediction, multiple genes for latent arithmetic')
     parser.add_argument('--weights', type=float, nargs='*', default=None, help='Optional weights for latent arithmetic')
-    parser.add_argument('--latent_mode', type=str, default='sum', choices=['sum', 'mean'])
+    parser.add_argument('--latent_mode', type=str, default='adaptive', choices=['sum', 'mean', 'adaptive'])
     parser.add_argument('--sample_steps', type=int, default=50)
     parser.add_argument('--guidance_scale', type=float, default=1.0)
     parser.add_argument('--atac_key', type=str, default=None)
@@ -104,6 +104,8 @@ def main():
     atac_feat = processor.get_cell_line_atac(cell_line_id, device=device)
     if atac_feat is not None:
         atac_feat = atac_feat.unsqueeze(0)
+    if len(args.perturb_genes) > 1 and atac_feat is not None:
+        print(">>> 提示: 组合扰动当前默认复用同一 cell-line baseline ATAC；若组合引发显著染色质变化，建议外部构建组合特异 ATAC 条件。")
 
     latents = []
     perturb_ids = []
