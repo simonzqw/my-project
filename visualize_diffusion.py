@@ -23,7 +23,7 @@ def get_args():
     parser.add_argument('--cell_line', type=str, default='0')
     parser.add_argument('--perturb_genes', type=str, nargs='+', required=True)
     parser.add_argument('--weights', type=float, nargs='*', default=None)
-    parser.add_argument('--latent_mode', type=str, default='sum', choices=['sum', 'mean'])
+    parser.add_argument('--latent_mode', type=str, default='adaptive', choices=['sum', 'mean', 'adaptive'])
     parser.add_argument('--sample_steps', type=int, default=50)
     parser.add_argument('--guidance_scale', type=float, default=1.0)
     parser.add_argument('--atac_key', type=str, default=None)
@@ -99,6 +99,8 @@ def visualize():
     atac_feat = processor.get_cell_line_atac(cell_line_id, device=device)
     if atac_feat is not None:
         atac_feat = atac_feat.unsqueeze(0)
+    if len(args.perturb_genes) > 1 and atac_feat is not None:
+        print(">>> 提示: 可视化组合扰动时默认复用同一 cell-line baseline ATAC，未显式建模组合特异 ATAC 变化。")
 
     latents = []
     deltas_single = []

@@ -221,6 +221,33 @@ class PerturbationDiffusionPredictor(nn.Module):
             nn.Linear(perturb_dim, perturb_dim),
         )
         self.fusion_norm = nn.LayerNorm(perturb_dim)
+        self.semantic_joint_encoder = nn.Sequential(
+            nn.Linear(perturb_dim * 4, perturb_dim),
+            nn.LayerNorm(perturb_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(perturb_dim, perturb_dim),
+            nn.LayerNorm(perturb_dim),
+        )
+        self.semantic_blend_gate = nn.Sequential(
+            nn.Linear(perturb_dim * 2, perturb_dim),
+            nn.SiLU(),
+            nn.Linear(perturb_dim, perturb_dim),
+            nn.Sigmoid(),
+        )
+        self.latent_composer = nn.Sequential(
+            nn.Linear(perturb_dim * 4, perturb_dim),
+            nn.LayerNorm(perturb_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(perturb_dim, perturb_dim),
+        )
+        self.latent_gate = nn.Sequential(
+            nn.Linear(perturb_dim * 2, perturb_dim),
+            nn.SiLU(),
+            nn.Linear(perturb_dim, perturb_dim),
+            nn.Sigmoid(),
+        )
 
         self.context_dim = n_genes + perturb_dim
         self.denoise_fn = SquidiffStyleDecoder(
@@ -285,8 +312,11 @@ class PerturbationDiffusionPredictor(nn.Module):
         dose_feat = self.dose_projection(dose).unsqueeze(1)
 
         p_emb = self._perturb_tokens(perturb, dose=dose)
+        p_pooled = p_emb.mean(dim=1)
 
         tokens = [rna_feat, p_emb, c_feat, dose_feat]
+        atac_token = None
+        drug_token = None
 
         if self.atac_projection is not None and atac_feat is not None:
             if atac_feat.dim() == 1:
@@ -304,7 +334,19 @@ class PerturbationDiffusionPredictor(nn.Module):
         attn_out, _ = self.feature_fusion(tokens, tokens, tokens)
         fused_feat = attn_out.mean(dim=1)
         fused_feat = self.fusion_norm(fused_feat + self.fusion_mlp(fused_feat))
-        return fused_feat
+        joint_core = torch.cat(
+            [rna_feat.squeeze(1), p_pooled, c_feat.squeeze(1), dose_feat.squeeze(1)],
+            dim=1,
+        )
+        joint_feat = self.semantic_joint_encoder(joint_core)
+        if atac_token is not None:
+            joint_feat = joint_feat + 0.5 * atac_token.squeeze(1)
+        if drug_token is not None:
+            joint_feat = joint_feat + 0.5 * drug_token.squeeze(1)
+
+        blend_gate = self.semantic_blend_gate(torch.cat([fused_feat, joint_feat], dim=1))
+        z_sem = blend_gate * fused_feat + (1.0 - blend_gate) * joint_feat
+        return z_sem
 
     def encode_context(
         self,
@@ -355,8 +397,8 @@ class PerturbationDiffusionPredictor(nn.Module):
             drug_feat=drug_feat,
         )
 
-    @staticmethod
     def combine_latents(
+        self,
         latents: Sequence[torch.Tensor],
         weights: Optional[Sequence[float]] = None,
         mode: str = "sum",
@@ -368,20 +410,47 @@ class PerturbationDiffusionPredictor(nn.Module):
         if len(weights) != len(latents):
             raise ValueError("weights 长度必须和 latents 一致。")
 
-        out = None
-        total_weight = 0.0
-        for latent, weight in zip(latents, weights):
-            if out is None:
-                out = latent * float(weight)
-            else:
-                out = out + latent * float(weight)
-            total_weight += float(weight)
+        stacked = torch.stack(latents, dim=1)  # [B, K, D]
+        weight_tensor = torch.tensor(weights, dtype=stacked.dtype, device=stacked.device)
+        weight_sum = weight_tensor.sum().clamp(min=1e-8)
+        norm_weight = weight_tensor / weight_sum
+
+        weighted = stacked * norm_weight.view(1, -1, 1)
+        out = weighted.sum(dim=1)
 
         if mode == "mean":
-            out = out / max(total_weight, 1e-8)
+            out = stacked.mean(dim=1)
+        elif mode == "adaptive":
+            if stacked.shape[1] == 1:
+                return out
+
+            pair_terms = []
+            k = stacked.shape[1]
+            for i in range(k):
+                for j in range(i + 1, k):
+                    li = stacked[:, i, :]
+                    lj = stacked[:, j, :]
+                    pair_input = torch.cat([li, lj, li * lj, torch.abs(li - lj)], dim=1)
+                    pair_terms.append(self.latent_composer(pair_input))
+
+            pair_agg = torch.stack(pair_terms, dim=1).mean(dim=1)
+            avg_latent = stacked.mean(dim=1)
+            gate = self.latent_gate(torch.cat([out, avg_latent], dim=1))
+            out = gate * out + (1.0 - gate) * (out + pair_agg)
         elif mode != "sum":
             raise ValueError(f"未知组合模式: {mode}")
         return out
+
+    @staticmethod
+    def interpolate_latents(
+        z_start: torch.Tensor,
+        z_end: torch.Tensor,
+        steps: int = 10,
+    ) -> torch.Tensor:
+        if steps < 2:
+            raise ValueError("steps 必须 >= 2。")
+        alphas = torch.linspace(0.0, 1.0, steps=steps, device=z_start.device, dtype=z_start.dtype).view(steps, 1, 1)
+        return (1.0 - alphas) * z_start.unsqueeze(0) + alphas * z_end.unsqueeze(0)
 
     def forward(
         self,
