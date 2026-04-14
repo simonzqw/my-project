@@ -85,6 +85,20 @@ def resolve_or_autopick_gene(processor, gene, cell_line_id):
     raise ValueError("未找到可用的非 control 扰动基因。")
 
 
+def get_observed_mean_expression(processor, cell_line_id, perturb_name):
+    obs = processor.adata.obs
+    cell_col = processor.cell_line_col
+    cl_name = processor.cell_line_categories[cell_line_id]
+    mask = (obs[cell_col].astype(str) == str(cl_name)) & (obs['perturbation'].astype(str) == str(perturb_name))
+    idx = np.where(mask.values)[0]
+    if len(idx) == 0:
+        return None
+    x = processor.adata.X[idx]
+    if hasattr(x, "toarray"):
+        x = x.toarray()
+    return np.asarray(x).mean(axis=0).astype(np.float32)
+
+
 def main():
     args = get_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -175,6 +189,11 @@ def main():
     pred_np = pred.squeeze(0).detach().cpu().numpy()
     ctrl_np = control.squeeze(0).detach().cpu().numpy()
     delta_np = pred_np - ctrl_np
+    true_np = None
+    if len(resolved_genes) == 1:
+        true_np = get_observed_mean_expression(processor, cell_line_id, resolved_genes[0])
+        if true_np is not None:
+            print(f">>> 已匹配真实均值样本: gene={resolved_genes[0]} | n={int(np.sum((processor.adata.obs['perturbation'].astype(str)==resolved_genes[0]).values))}")
 
     os.makedirs(args.save_dir, exist_ok=True)
     prefix = "__".join(resolved_genes)
@@ -188,7 +207,16 @@ def main():
         'prediction': pred_np,
         'delta': delta_np,
         'abs_delta': np.abs(delta_np),
-    }).sort_values('abs_delta', ascending=False)
+    })
+    if true_np is not None:
+        df['true'] = true_np
+        df['true_delta'] = true_np - ctrl_np
+        df['abs_true_delta'] = np.abs(df['true_delta'])
+        rank_score = 0.6 * df['abs_true_delta'] + 0.4 * df['abs_delta']
+        df['rank_score'] = rank_score
+        df = df.sort_values('rank_score', ascending=False)
+    else:
+        df = df.sort_values('abs_delta', ascending=False)
     df.to_csv(csv_path, index=False)
     np.save(latent_path, latent_used.squeeze(0).detach().cpu().numpy())
 
@@ -221,15 +249,39 @@ def main():
         np.save(traj_path, traj_arr)
         print(f">>> 插值轨迹保存: {traj_path}")
 
-    top_df = df.head(20).iloc[::-1]
+    top_df = df.head(20).copy()
     plt.style.use('seaborn-v0_8-whitegrid')
-    plt.figure(figsize=(10, 8))
-    sns.barplot(data=top_df, x='delta', y='gene')
-    plt.title(f"Top 20 response genes | {' + '.join(resolved_genes)} | cell_line={args.cell_line}")
-    plt.xlabel("Predicted delta")
-    plt.ylabel("Gene")
-    plt.tight_layout()
-    plt.savefig(fig_path, dpi=200)
+    if true_np is not None:
+        fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+        plot_df = top_df.iloc[::-1]
+        y_pos = np.arange(len(plot_df))
+        axes[0].barh(y_pos - 0.22, plot_df['control'].values, height=0.2, color='#7f8c8d', label='Control')
+        axes[0].barh(y_pos, plot_df['prediction'].values, height=0.2, color='#c0392b', label='Predicted')
+        axes[0].barh(y_pos + 0.22, plot_df['true'].values, height=0.2, color='#2980b9', label='True')
+        axes[0].set_yticks(y_pos)
+        axes[0].set_yticklabels(plot_df['gene'].tolist(), fontsize=8)
+        axes[0].set_title("Control vs Predicted vs True (Top genes)")
+        axes[0].legend(frameon=False)
+
+        axes[1].scatter(plot_df['true_delta'].values, plot_df['delta'].values, alpha=0.8, color='#8e44ad')
+        min_v = float(min(plot_df['true_delta'].min(), plot_df['delta'].min()))
+        max_v = float(max(plot_df['true_delta'].max(), plot_df['delta'].max()))
+        axes[1].plot([min_v, max_v], [min_v, max_v], '--', color='#d95f02', linewidth=1.5)
+        corr = np.corrcoef(plot_df['true_delta'].values, plot_df['delta'].values)[0, 1]
+        axes[1].set_title(f"True delta vs Pred delta | Pearson={corr:.4f}")
+        axes[1].set_xlabel("True delta")
+        axes[1].set_ylabel("Predicted delta")
+        plt.suptitle(f"{' + '.join(resolved_genes)} | cell_line={args.cell_line}", fontsize=12)
+        plt.tight_layout()
+    else:
+        plot_df = top_df.iloc[::-1]
+        plt.figure(figsize=(10, 8))
+        sns.barplot(data=plot_df, x='delta', y='gene')
+        plt.title(f"Top 20 response genes | {' + '.join(resolved_genes)} | cell_line={args.cell_line}")
+        plt.xlabel("Predicted delta")
+        plt.ylabel("Gene")
+        plt.tight_layout()
+    plt.savefig(fig_path, dpi=220)
     plt.close()
 
     print(f">>> 预测 CSV: {csv_path}")

@@ -107,6 +107,20 @@ def select_display_genes(delta_combo, delta_additive, gene_names, top_n=30):
     return top_idx, top_genes
 
 
+def get_observed_mean_expression(processor, cell_line_id, perturb_name):
+    obs = processor.adata.obs
+    cell_col = processor.cell_line_col
+    cl_name = processor.cell_line_categories[cell_line_id]
+    mask = (obs[cell_col].astype(str) == str(cl_name)) & (obs['perturbation'].astype(str) == str(perturb_name))
+    idx = np.where(mask.values)[0]
+    if len(idx) == 0:
+        return None
+    x = processor.adata.X[idx]
+    if hasattr(x, "toarray"):
+        x = x.toarray()
+    return np.asarray(x).mean(axis=0).astype(np.float32)
+
+
 def visualize():
     args = get_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -187,7 +201,13 @@ def visualize():
         delta_additive = np.sum(np.stack(deltas_single, axis=0), axis=0)
 
     baseline = control.squeeze(0).detach().cpu().numpy()
-    delta_combo = combo_pred.squeeze(0).detach().cpu().numpy() - baseline
+    pred_expr = combo_pred.squeeze(0).detach().cpu().numpy()
+    delta_combo = pred_expr - baseline
+    observed_expr = None
+    if len(resolved_genes) == 1:
+        observed_expr = get_observed_mean_expression(processor, cell_line_id, resolved_genes[0])
+        if observed_expr is not None:
+            print(f">>> 已匹配真实均值样本: gene={resolved_genes[0]}")
 
     plt.style.use('seaborn-v0_8-whitegrid')
     fig, axes = plt.subplots(2, 2, figsize=(20, 14))
@@ -207,14 +227,20 @@ def visualize():
     gene_names = processor.adata.var_names.tolist()
     top_idx, top_genes = select_display_genes(delta_combo, delta_additive, gene_names, top_n=args.top_n)
     top_ctrl = baseline[top_idx]
-    top_pred = combo_pred.squeeze(0).detach().cpu().numpy()[top_idx]
+    top_pred = pred_expr[top_idx]
     top_add = delta_additive[top_idx]
     top_diff = delta_combo[top_idx]
+    top_true = observed_expr[top_idx] if observed_expr is not None else None
 
     # Panel B: control vs predicted expression (paired comparison)
     y_pos = np.arange(len(top_genes))
-    ax_pair.barh(y_pos - 0.18, top_ctrl, height=0.34, color='#7f8c8d', label='Control')
-    ax_pair.barh(y_pos + 0.18, top_pred, height=0.34, color='#c0392b', label='Predicted')
+    if top_true is not None:
+        ax_pair.barh(y_pos - 0.24, top_ctrl, height=0.22, color='#7f8c8d', label='Control')
+        ax_pair.barh(y_pos, top_pred, height=0.22, color='#c0392b', label='Predicted')
+        ax_pair.barh(y_pos + 0.24, top_true, height=0.22, color='#2980b9', label='True')
+    else:
+        ax_pair.barh(y_pos - 0.18, top_ctrl, height=0.34, color='#7f8c8d', label='Control')
+        ax_pair.barh(y_pos + 0.18, top_pred, height=0.34, color='#c0392b', label='Predicted')
     ax_pair.set_yticks(y_pos)
     ax_pair.set_yticklabels(top_genes, fontsize=9)
     ax_pair.invert_yaxis()
@@ -223,11 +249,14 @@ def visualize():
     ax_pair.legend(frameon=False, loc='lower right')
 
     # Panel C: heatmap of additive/diffusion/nonlinearity deltas
-    heat_df = pd.DataFrame(
-        np.vstack([top_add, top_diff, top_diff - top_add]),
-        index=['Additive delta', 'Diffusion delta', 'Nonlinear residual'],
-        columns=top_genes,
-    )
+    if top_true is not None:
+        top_true_delta = top_true - top_ctrl
+        heat_values = np.vstack([top_true_delta, top_diff, top_diff - top_true_delta])
+        heat_index = ['True delta', 'Diffusion delta', 'Pred-True residual']
+    else:
+        heat_values = np.vstack([top_add, top_diff, top_diff - top_add])
+        heat_index = ['Additive delta', 'Diffusion delta', 'Nonlinear residual']
+    heat_df = pd.DataFrame(heat_values, index=heat_index, columns=top_genes)
     sns.heatmap(
         heat_df,
         ax=ax_heatmap,
@@ -241,12 +270,15 @@ def visualize():
     ax_heatmap.tick_params(axis='x', labelrotation=65, labelsize=8)
 
     # Panel D: strongest nonlinearity ranking
-    nonlin = np.abs(top_diff - top_add)
+    nonlin = np.abs(top_diff - (top_true - top_ctrl)) if top_true is not None else np.abs(top_diff - top_add)
     order = np.argsort(nonlin)[::-1]
     ax_nonlin.bar(np.arange(len(order)), nonlin[order], color='#8e44ad', alpha=0.9)
     ax_nonlin.set_xticks(np.arange(len(order)))
     ax_nonlin.set_xticklabels([top_genes[i] for i in order], rotation=65, ha='right', fontsize=8)
-    ax_nonlin.set_title("Nonlinear effect ranking | |Diffusion - Additive|", fontsize=13)
+    ax_nonlin.set_title(
+        "Residual ranking | |Diffusion - True|" if top_true is not None else "Nonlinear effect ranking | |Diffusion - Additive|",
+        fontsize=13
+    )
     ax_nonlin.set_ylabel("Absolute residual")
 
     # Save a companion table for reproducibility
@@ -256,8 +288,11 @@ def visualize():
         'pred_expr': top_pred,
         'additive_delta': top_add,
         'diffusion_delta': top_diff,
-        'nonlinear_abs_residual': np.abs(top_diff - top_add),
+        'nonlinear_abs_residual': nonlin,
     }).sort_values('nonlinear_abs_residual', ascending=False)
+    if top_true is not None:
+        report_df['true_expr'] = top_true
+        report_df['true_delta'] = top_true - top_ctrl
     report_csv = os.path.splitext(args.save_path)[0] + "_top_genes.csv"
     report_df.to_csv(report_csv, index=False)
 
