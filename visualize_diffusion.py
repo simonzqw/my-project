@@ -30,6 +30,7 @@ def get_args():
     parser.add_argument('--latent_mode', type=str, default='adaptive', choices=['sum', 'mean', 'adaptive'])
     parser.add_argument('--sample_steps', type=int, default=50)
     parser.add_argument('--guidance_scale', type=float, default=1.0)
+    parser.add_argument('--top_n', type=int, default=30)
     parser.add_argument('--atac_key', type=str, default=None)
     parser.add_argument('--atac_bank_path', type=str, default=None)
     parser.add_argument('--background_key', type=str, default='cell_context')
@@ -97,6 +98,13 @@ def load_model(checkpoint, processor, n_genes, n_perts, n_cell_lines, device):
                 p.data.copy_(checkpoint['ema_state_dict'][name].to(device))
     model.eval()
     return model
+
+
+def select_display_genes(delta_combo, delta_additive, gene_names, top_n=30):
+    score = 0.6 * np.abs(delta_combo) + 0.4 * np.abs(delta_combo - delta_additive)
+    top_idx = np.argsort(score)[-min(top_n, len(score)):][::-1]
+    top_genes = [gene_names[i] for i in top_idx]
+    return top_idx, top_genes
 
 
 def visualize():
@@ -182,37 +190,83 @@ def visualize():
     delta_combo = combo_pred.squeeze(0).detach().cpu().numpy() - baseline
 
     plt.style.use('seaborn-v0_8-whitegrid')
-    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+    fig, axes = plt.subplots(2, 2, figsize=(20, 14))
+    ax_scatter, ax_pair, ax_heatmap, ax_nonlin = axes[0, 0], axes[0, 1], axes[1, 0], axes[1, 1]
 
-    sns.scatterplot(x=delta_additive, y=delta_combo, ax=axes[0], alpha=0.5, color='purple')
+    # Panel A: additive vs diffusion scatter
+    sns.scatterplot(x=delta_additive, y=delta_combo, ax=ax_scatter, alpha=0.45, color='#5b4db7', s=18)
     min_val = float(min(delta_additive.min(), delta_combo.min()))
     max_val = float(max(delta_additive.max(), delta_combo.max()))
-    axes[0].plot([min_val, max_val], [min_val, max_val], 'r--')
+    ax_scatter.plot([min_val, max_val], [min_val, max_val], '--', color='#d95f02', linewidth=1.8)
     corr = np.corrcoef(delta_additive, delta_combo)[0, 1]
-    axes[0].set_title(f"{' + '.join(resolved_genes)} | Pearson={corr:.4f}", fontsize=14)
-    axes[0].set_xlabel("Additive expectation")
-    axes[0].set_ylabel("Diffusion prediction")
+    ax_scatter.set_title(f"Additive vs Diffusion Delta | {' + '.join(resolved_genes)} | Pearson={corr:.4f}", fontsize=13)
+    ax_scatter.set_xlabel("Additive expectation (delta)")
+    ax_scatter.set_ylabel("Diffusion prediction (delta)")
 
-    diff = np.abs(delta_combo - delta_additive)
-    top_idx = np.argsort(diff)[-15:][::-1]
-    plot_data = []
+    # Gene selection for display
     gene_names = processor.adata.var_names.tolist()
-    for idx in top_idx:
-        g = gene_names[idx]
-        plot_data.append({'Gene': g, 'Value': float(delta_additive[idx]), 'Type': 'Additive'})
-        plot_data.append({'Gene': g, 'Value': float(delta_combo[idx]), 'Type': 'Diffusion'})
+    top_idx, top_genes = select_display_genes(delta_combo, delta_additive, gene_names, top_n=args.top_n)
+    top_ctrl = baseline[top_idx]
+    top_pred = combo_pred.squeeze(0).detach().cpu().numpy()[top_idx]
+    top_add = delta_additive[top_idx]
+    top_diff = delta_combo[top_idx]
 
-    df_bar = pd.DataFrame(plot_data)
-    sns.barplot(data=df_bar, x='Gene', y='Value', hue='Type', ax=axes[1], palette={'Additive': 'gray', 'Diffusion': 'crimson'})
-    axes[1].set_title("Top 15 non-additive genes", fontsize=14)
-    axes[1].set_xticklabels(axes[1].get_xticklabels(), rotation=45, ha='right')
-    axes[1].set_ylabel("Expression delta")
+    # Panel B: control vs predicted expression (paired comparison)
+    y_pos = np.arange(len(top_genes))
+    ax_pair.barh(y_pos - 0.18, top_ctrl, height=0.34, color='#7f8c8d', label='Control')
+    ax_pair.barh(y_pos + 0.18, top_pred, height=0.34, color='#c0392b', label='Predicted')
+    ax_pair.set_yticks(y_pos)
+    ax_pair.set_yticklabels(top_genes, fontsize=9)
+    ax_pair.invert_yaxis()
+    ax_pair.set_title(f"Top {len(top_genes)} genes: Control vs Predicted expression", fontsize=13)
+    ax_pair.set_xlabel("Expression")
+    ax_pair.legend(frameon=False, loc='lower right')
+
+    # Panel C: heatmap of additive/diffusion/nonlinearity deltas
+    heat_df = pd.DataFrame(
+        np.vstack([top_add, top_diff, top_diff - top_add]),
+        index=['Additive delta', 'Diffusion delta', 'Nonlinear residual'],
+        columns=top_genes,
+    )
+    sns.heatmap(
+        heat_df,
+        ax=ax_heatmap,
+        cmap='coolwarm',
+        center=0.0,
+        cbar_kws={'shrink': 0.7},
+    )
+    ax_heatmap.set_title("Delta structure on selected genes", fontsize=13)
+    ax_heatmap.set_xlabel("Genes")
+    ax_heatmap.set_ylabel("")
+    ax_heatmap.tick_params(axis='x', labelrotation=65, labelsize=8)
+
+    # Panel D: strongest nonlinearity ranking
+    nonlin = np.abs(top_diff - top_add)
+    order = np.argsort(nonlin)[::-1]
+    ax_nonlin.bar(np.arange(len(order)), nonlin[order], color='#8e44ad', alpha=0.9)
+    ax_nonlin.set_xticks(np.arange(len(order)))
+    ax_nonlin.set_xticklabels([top_genes[i] for i in order], rotation=65, ha='right', fontsize=8)
+    ax_nonlin.set_title("Nonlinear effect ranking | |Diffusion - Additive|", fontsize=13)
+    ax_nonlin.set_ylabel("Absolute residual")
+
+    # Save a companion table for reproducibility
+    report_df = pd.DataFrame({
+        'gene': top_genes,
+        'control_expr': top_ctrl,
+        'pred_expr': top_pred,
+        'additive_delta': top_add,
+        'diffusion_delta': top_diff,
+        'nonlinear_abs_residual': np.abs(top_diff - top_add),
+    }).sort_values('nonlinear_abs_residual', ascending=False)
+    report_csv = os.path.splitext(args.save_path)[0] + "_top_genes.csv"
+    report_df.to_csv(report_csv, index=False)
 
     os.makedirs(os.path.dirname(args.save_path) or '.', exist_ok=True)
     plt.tight_layout()
-    plt.savefig(args.save_path, dpi=200)
+    plt.savefig(args.save_path, dpi=260)
     plt.close(fig)
     print(f">>> 图已保存: {args.save_path}")
+    print(f">>> 基因报告: {report_csv}")
 
 
 if __name__ == "__main__":
