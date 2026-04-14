@@ -2,6 +2,10 @@
 import argparse
 import os
 
+omp_threads = os.environ.get("OMP_NUM_THREADS")
+if not (omp_threads and omp_threads.isdigit() and int(omp_threads) > 0):
+    os.environ["OMP_NUM_THREADS"] = "1"
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -62,6 +66,25 @@ def resolve_cell_line(processor, cell_line_arg):
     return processor.cell_line_map[cell_line_arg]
 
 
+def resolve_or_autopick_gene(processor, gene, cell_line_id):
+    if gene in processor.perturb_map:
+        return gene, False
+
+    obs = processor.adata.obs
+    cell_col = processor.cell_line_col
+    cl_name = processor.cell_line_categories[cell_line_id]
+    subset = obs[obs[cell_col].astype(str) == str(cl_name)]
+    counts = subset['perturbation'].astype(str).value_counts()
+    for g in counts.index.tolist():
+        if g != 'control' and g in processor.perturb_map:
+            return g, True
+
+    for g in processor.perturb_categories:
+        if g != 'control':
+            return g, True
+    raise ValueError("未找到可用的非 control 扰动基因。")
+
+
 def main():
     args = get_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -111,10 +134,13 @@ def main():
 
     latents = []
     perturb_ids = []
+    resolved_genes = []
     for gene in args.perturb_genes:
-        if gene not in processor.perturb_map:
-            raise ValueError(f"扰动 {gene} 不在 perturbation 列表中。")
-        pid = processor.perturb_map[gene]
+        resolved_gene, auto_picked = resolve_or_autopick_gene(processor, gene, cell_line_id)
+        if auto_picked:
+            print(f">>> 提示: 扰动 {gene} 不存在，自动替换为 {resolved_gene}")
+        resolved_genes.append(resolved_gene)
+        pid = processor.perturb_map[resolved_gene]
         perturb_ids.append(pid)
         latent = model.get_latent(
             rna_control=control,
@@ -151,7 +177,7 @@ def main():
     delta_np = pred_np - ctrl_np
 
     os.makedirs(args.save_dir, exist_ok=True)
-    prefix = "__".join(args.perturb_genes)
+    prefix = "__".join(resolved_genes)
     csv_path = os.path.join(args.save_dir, f"{prefix}_prediction.csv")
     fig_path = os.path.join(args.save_dir, f"{prefix}_top_genes.png")
     latent_path = os.path.join(args.save_dir, f"{prefix}_latent.npy")
@@ -167,9 +193,10 @@ def main():
     np.save(latent_path, latent_used.squeeze(0).detach().cpu().numpy())
 
     if args.interpolate_to is not None:
-        if args.interpolate_to not in processor.perturb_map:
-            raise ValueError(f"interpolate_to 扰动 {args.interpolate_to} 不在 perturbation 列表中。")
-        pid_to = processor.perturb_map[args.interpolate_to]
+        interp_gene, interp_auto = resolve_or_autopick_gene(processor, args.interpolate_to, cell_line_id)
+        if interp_auto:
+            print(f">>> 提示: interpolate_to={args.interpolate_to} 不存在，自动替换为 {interp_gene}")
+        pid_to = processor.perturb_map[interp_gene]
         latent_to = model.get_latent(
             rna_control=control,
             perturb=torch.tensor([pid_to], dtype=torch.long, device=device),
@@ -190,7 +217,7 @@ def main():
             )
             traj_preds.append(p.squeeze(0).detach().cpu().numpy())
         traj_arr = np.stack(traj_preds, axis=0)
-        traj_path = os.path.join(args.save_dir, f"{prefix}__to__{args.interpolate_to}_trajectory.npy")
+        traj_path = os.path.join(args.save_dir, f"{prefix}__to__{interp_gene}_trajectory.npy")
         np.save(traj_path, traj_arr)
         print(f">>> 插值轨迹保存: {traj_path}")
 
@@ -198,7 +225,7 @@ def main():
     plt.style.use('seaborn-v0_8-whitegrid')
     plt.figure(figsize=(10, 8))
     sns.barplot(data=top_df, x='delta', y='gene')
-    plt.title(f"Top 20 response genes | {' + '.join(args.perturb_genes)} | cell_line={args.cell_line}")
+    plt.title(f"Top 20 response genes | {' + '.join(resolved_genes)} | cell_line={args.cell_line}")
     plt.xlabel("Predicted delta")
     plt.ylabel("Gene")
     plt.tight_layout()
