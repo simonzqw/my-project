@@ -2,6 +2,10 @@
 import argparse
 import os
 
+omp_threads = os.environ.get("OMP_NUM_THREADS")
+if not (omp_threads and omp_threads.isdigit() and int(omp_threads) > 0):
+    os.environ["OMP_NUM_THREADS"] = "1"
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -23,7 +27,7 @@ def get_args():
     parser.add_argument('--cell_line', type=str, default='0')
     parser.add_argument('--perturb_genes', type=str, nargs='+', required=True)
     parser.add_argument('--weights', type=float, nargs='*', default=None)
-    parser.add_argument('--latent_mode', type=str, default='sum', choices=['sum', 'mean'])
+    parser.add_argument('--latent_mode', type=str, default='adaptive', choices=['sum', 'mean', 'adaptive'])
     parser.add_argument('--sample_steps', type=int, default=50)
     parser.add_argument('--guidance_scale', type=float, default=1.0)
     parser.add_argument('--atac_key', type=str, default=None)
@@ -43,6 +47,25 @@ def resolve_cell_line(processor, cell_line_arg):
     if cell_line_arg not in processor.cell_line_map:
         raise ValueError(f"未找到 cell line: {cell_line_arg}")
     return processor.cell_line_map[cell_line_arg]
+
+
+def resolve_or_autopick_gene(processor, gene, cell_line_id):
+    if gene in processor.perturb_map:
+        return gene, False
+
+    obs = processor.adata.obs
+    cell_col = processor.cell_line_col
+    cl_name = processor.cell_line_categories[cell_line_id]
+    subset = obs[obs[cell_col].astype(str) == str(cl_name)]
+    counts = subset['perturbation'].astype(str).value_counts()
+    for g in counts.index.tolist():
+        if g != 'control' and g in processor.perturb_map:
+            return g, True
+
+    for g in processor.perturb_categories:
+        if g != 'control':
+            return g, True
+    raise ValueError("未找到可用的非 control 扰动基因。")
 
 
 def load_model(checkpoint, processor, n_genes, n_perts, n_cell_lines, device):
@@ -99,14 +122,19 @@ def visualize():
     atac_feat = processor.get_cell_line_atac(cell_line_id, device=device)
     if atac_feat is not None:
         atac_feat = atac_feat.unsqueeze(0)
+    if len(args.perturb_genes) > 1 and atac_feat is not None:
+        print(">>> 提示: 可视化组合扰动时默认复用同一 cell-line baseline ATAC，未显式建模组合特异 ATAC 变化。")
 
     latents = []
     deltas_single = []
     perturb_ids = []
+    resolved_genes = []
     for gene in args.perturb_genes:
-        if gene not in processor.perturb_map:
-            raise ValueError(f"扰动 {gene} 不在 perturbation 列表中。")
-        pid = processor.perturb_map[gene]
+        resolved_gene, auto_picked = resolve_or_autopick_gene(processor, gene, cell_line_id)
+        if auto_picked:
+            print(f">>> 提示: 扰动 {gene} 不存在，自动替换为 {resolved_gene}")
+        resolved_genes.append(resolved_gene)
+        pid = processor.perturb_map[resolved_gene]
         perturb_ids.append(pid)
 
         latent = model.get_latent(
@@ -161,7 +189,7 @@ def visualize():
     max_val = float(max(delta_additive.max(), delta_combo.max()))
     axes[0].plot([min_val, max_val], [min_val, max_val], 'r--')
     corr = np.corrcoef(delta_additive, delta_combo)[0, 1]
-    axes[0].set_title(f"{' + '.join(args.perturb_genes)} | Pearson={corr:.4f}", fontsize=14)
+    axes[0].set_title(f"{' + '.join(resolved_genes)} | Pearson={corr:.4f}", fontsize=14)
     axes[0].set_xlabel("Additive expectation")
     axes[0].set_ylabel("Diffusion prediction")
 
