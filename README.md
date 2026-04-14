@@ -210,3 +210,17 @@ python build_atac_bank.py \
 输出：
 - `atac_bank_out/atac_bank.npz`
 - `atac_bank_out/atac_bank_meta.json`
+
+---
+
+## 9. Cross-species Context（实验脚本）
+
+新增 3 个实验脚本（`scripts/`）用于“去 cell_line 离散依赖、改用 control RNA + ATAC context”路线：
+
+- `prepare_mouse_context.py`：把 mouse scRNA + ATAC peaks 处理为
+  - `mouse_control_expr.npy`
+  - `mouse_atac_token.npy`
+  - `shared_gene_order.txt`
+  - `mouse_context_meta.json`
+- `train_cross_species_ctx.py`：训练不依赖 `cell_line` 的 `PerturbationPredictorNoCellLine`（位于 `models/reasoning_mlp.py`）。
+- `cross_species_infer_ctx.py`：用 `mouse_control_expr.npy + mouse_atac_token.npy + human checkpoint` 做跨物种条件推理。
