@@ -17,6 +17,33 @@ from utils.diffusion_schedule import LossSecondMomentResampler, UniformTimestepS
 from utils.emb_loader import GeneEmbeddingLoader
 
 
+def _hr(char: str = "─", width: int = 72) -> str:
+    return char * width
+
+
+def print_run_header(args, device):
+    print(f"\n┌{_hr('─', 70)}┐")
+    print(f"│ {'scERso Diffusion Training':^68} │")
+    print(f"├{_hr('─', 70)}┤")
+    print(f"│ device: {str(device):<60} │")
+    print(f"│ data:   {args.data_path[:60]:<60} │")
+    print(f"│ split:  {args.split_strategy:<60} │")
+    print(f"│ steps:  t={args.timesteps}, sample={args.sample_steps}, sampler={args.timestep_sampler:<24} │")
+    print(f"│ cfg:    scale={args.guidance_scale:.2f}, cond_dropout={args.cond_dropout:.2f}, amp={str(args.amp):<15} │")
+    print(f"└{_hr('─', 70)}┘")
+
+
+def print_epoch_summary(epoch, total_epochs, train_loss, val_loss, metrics):
+    top20_p = metrics.get('top20_pearson', 0.0)
+    delta_p = metrics.get('delta_pearson', 0.0)
+    top20_m = metrics.get('top20_mse', 0.0)
+    print(
+        f"[E{epoch:03d}/{total_epochs:03d}] "
+        f"train={train_loss:.4f}  val={val_loss:.4f}  "
+        f"top20_p={top20_p:.4f}  delta_p={delta_p:.4f}  top20_mse={top20_m:.4f}"
+    )
+
+
 class EarlyStopping:
     def __init__(self, patience=15, min_delta=1e-4):
         self.patience = patience
@@ -102,7 +129,6 @@ def get_args():
 
     parser.add_argument('--timesteps', type=int, default=1000)
     parser.add_argument('--perturb_dim', type=int, default=200)
-    parser.add_argument('--cell_line_dim', type=int, default=32)
     parser.add_argument('--hidden_dims', type=int, nargs='+', default=[512, 512, 512])
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--dose_dim', type=int, default=32)
@@ -175,7 +201,7 @@ def calculate_metrics(pred, target, ctrl, top_k=(10, 20, 50)):
 def train():
     args = get_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f">>> scERso Diffusion 启动 | device={device} | split={args.split_strategy}")
+    print_run_header(args, device)
 
     processor = DataProcessor(
         args.data_path,
@@ -186,7 +212,7 @@ def train():
         atac_bank_path=args.atac_bank_path,
         background_key=args.background_key,
     )
-    n_genes, n_perts, n_cell_lines = processor.load_data()
+    n_genes, n_perts, _ = processor.load_data()
     train_loader, val_loader, test_loader = processor.prepare_loaders(
         batch_size=args.batch_size,
         rna_noise=0.0,
@@ -205,10 +231,8 @@ def train():
     model = PerturbationDiffusionPredictor(
         n_genes=n_genes,
         n_perturbations=n_perts,
-        n_cell_lines=n_cell_lines,
         pretrained_weights=pretrained_weights,
         perturb_dim=args.perturb_dim,
-        cell_line_dim=args.cell_line_dim,
         hidden_dims=args.hidden_dims,
         dropout=args.dropout,
         timesteps=args.timesteps,
@@ -238,7 +262,7 @@ def train():
     start_epoch = 0
 
     if args.resume_path is not None:
-        print(f">>> 从断点恢复: {args.resume_path}")
+        print(f"↺ Resume from: {args.resume_path}")
         ckpt = torch.load(args.resume_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
@@ -255,13 +279,12 @@ def train():
         model.train()
         optimizer.zero_grad()
         train_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        pbar = tqdm(train_loader, desc=f"E{epoch+1:03d}/{args.epochs:03d}", leave=False)
 
         for i, batch in enumerate(pbar):
             ctrl_rna = batch['rna_control'].to(device)
             target_rna = batch['rna_target'].to(device)
             perturb = batch['perturb'].to(device)
-            cell_line = batch['cell_line'].to(device)
             dose = batch['dose'].to(device) if 'dose' in batch else None
             atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
             drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
@@ -271,7 +294,6 @@ def train():
                 loss = model(
                     ctrl_rna,
                     perturb,
-                    cell_line,
                     target_rna=target_rna,
                     dose=dose,
                     atac_feat=atac_feat,
@@ -292,8 +314,8 @@ def train():
 
             train_loss += float(loss.item())
             timestep_sampler.update_with_losses(t, torch.full_like(t, float(loss.detach().item()), dtype=torch.float32))
-            if i % 100 == 0:
-                pbar.set_postfix({'diff_loss': f"{loss.item():.6f}"})
+            if i % 200 == 0:
+                pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
         if len(train_loader) % args.accum_steps != 0:
             scaler.unscale_(optimizer)
@@ -312,12 +334,11 @@ def train():
                 ctrl = batch['rna_control'].to(device)
                 target = batch['rna_target'].to(device)
                 perturb = batch['perturb'].to(device)
-                cell_line = batch['cell_line'].to(device)
                 dose = batch['dose'].to(device) if 'dose' in batch else None
                 atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
                 drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
                 t, weights = timestep_sampler.sample(ctrl.shape[0], device)
-                loss = model(ctrl, perturb, cell_line, target, dose=dose, atac_feat=atac_feat, drug_feat=drug_feat, t=t, weights=weights)
+                loss = model(ctrl, perturb, target, dose=dose, atac_feat=atac_feat, drug_feat=drug_feat, t=t, weights=weights)
                 val_loss += float(loss.item())
 
         val_metrics = []
@@ -329,7 +350,6 @@ def train():
                 ctrl = batch['rna_control'].to(device)
                 target = batch['rna_target'].to(device)
                 perturb = batch['perturb'].to(device)
-                cell_line = batch['cell_line'].to(device)
                 dose = batch['dose'].to(device) if 'dose' in batch else None
                 atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
                 drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
@@ -337,7 +357,6 @@ def train():
                 pred = model.predict_single(
                     rna_control=ctrl,
                     perturb=perturb,
-                    cell_line=cell_line,
                     dose=dose,
                     atac_feat=atac_feat,
                     drug_feat=drug_feat,
@@ -350,13 +369,7 @@ def train():
         avg_val_loss = val_loss / max(len(val_loader), 1)
         final_m = {k: float(np.mean([m[k] for m in val_metrics])) for k in val_metrics[0].keys()} if val_metrics else {}
 
-        print(
-            f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
-            f"All Pearson: {final_m.get('all_pearson', 0.0):.4f} | "
-            f"Delta Pearson: {final_m.get('delta_pearson', 0.0):.4f} | "
-            f"Top20 MSE: {final_m.get('top20_mse', 0.0):.4f} | "
-            f"Top20 Pearson: {final_m.get('top20_pearson', 0.0):.4f}"
-        )
+        print_epoch_summary(epoch + 1, args.epochs, avg_train_loss, avg_val_loss, final_m)
 
         scheduler.step()
         current_score = final_m.get('top20_pearson', 0.0)
@@ -366,11 +379,9 @@ def train():
             'args': args,
             'n_genes': n_genes,
             'n_perts': n_perts,
-            'n_cell_lines': n_cell_lines,
-            'cell_line_categories': processor.cell_line_categories,
             'perturb_categories': processor.perturb_categories,
-            'baselines': processor.cell_line_baselines,
-            'atac_baselines': processor.cell_line_atac_baselines,
+            'atac_dim': atac_dim,
+            'use_atac': bool(processor.atac_features is not None),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'scaler_state_dict': scaler.state_dict(),
@@ -383,7 +394,7 @@ def train():
             best_score = current_score
             ckpt['best_score'] = best_score
             torch.save(ckpt, os.path.join(args.save_dir, "best_model_diff.pth"))
-            print(f"*** 发现更优模型 (Top20 Pearson: {best_score:.4f}), 已保存")
+            print(f"  ↳ New best: top20_p={best_score:.4f}  saved=best_model_diff.pth")
 
         torch.save(ckpt, os.path.join(args.save_dir, "latest.pth"))
         if args.save_every_epoch:
@@ -391,10 +402,10 @@ def train():
             rotate_epoch_checkpoints(args.save_dir, args.keep_last_n)
 
         if early_stopper(current_score):
-            print("!!! 早停触发")
+            print("  ↳ Early stopping triggered.")
             break
 
-    print("\n>>> 训练结束")
+    print(f"\n✓ Training finished. Artifacts in: {args.save_dir}")
 
 
 if __name__ == "__main__":
