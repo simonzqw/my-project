@@ -39,10 +39,8 @@ def infer_model_config(checkpoint, processor):
     ckpt_args = checkpoint.get('args', argparse.Namespace())
     state_dict = checkpoint['model_state_dict']
     perturb_dim = int(state_dict['perturb_embedding.weight'].shape[1])
-    cell_line_dim = int(state_dict['cell_line_embedding.weight'].shape[1])
     return dict(
         perturb_dim=perturb_dim,
-        cell_line_dim=cell_line_dim,
         hidden_dims=getattr(ckpt_args, 'hidden_dims', [512, 512, 512]),
         dropout=getattr(ckpt_args, 'dropout', 0.1),
         timesteps=getattr(ckpt_args, 'timesteps', 1000),
@@ -117,9 +115,7 @@ def main():
     model = PerturbationDiffusionPredictor(
         n_genes=n_genes,
         n_perturbations=n_perts,
-        n_cell_lines=n_cell_lines,
         perturb_dim=config['perturb_dim'],
-        cell_line_dim=config['cell_line_dim'],
         hidden_dims=config['hidden_dims'],
         dropout=config['dropout'],
         timesteps=config['timesteps'],
@@ -159,7 +155,6 @@ def main():
         latent = model.get_latent(
             rna_control=control,
             perturb=torch.tensor([pid], dtype=torch.long, device=device),
-            cell_line=cell_line_tensor,
             atac_feat=atac_feat,
         )
         latents.append(latent)
@@ -168,7 +163,6 @@ def main():
         pred = model.predict_single(
             rna_control=control,
             perturb=torch.tensor([perturb_ids[0]], dtype=torch.long, device=device),
-            cell_line=cell_line_tensor,
             atac_feat=atac_feat,
             sample_steps=args.sample_steps,
             guidance_scale=args.guidance_scale,
@@ -178,7 +172,6 @@ def main():
         latent_used = model.combine_latents(latents, weights=args.weights, mode=args.latent_mode)
         pred = model.predict_from_latent(
             rna_control=control,
-            cell_line=cell_line_tensor,
             latent=latent_used,
             perturb=torch.tensor([perturb_ids[0]], dtype=torch.long, device=device),
             atac_feat=atac_feat,
@@ -228,7 +221,6 @@ def main():
         latent_to = model.get_latent(
             rna_control=control,
             perturb=torch.tensor([pid_to], dtype=torch.long, device=device),
-            cell_line=cell_line_tensor,
             atac_feat=atac_feat,
         )
         interp = model.interpolate_latents(latents[0], latent_to, steps=args.interp_steps)
@@ -236,7 +228,6 @@ def main():
         for i in range(interp.shape[0]):
             p = model.predict_from_latent(
                 rna_control=control,
-                cell_line=cell_line_tensor,
                 latent=interp[i],
                 perturb=torch.tensor([perturb_ids[0]], dtype=torch.long, device=device),
                 atac_feat=atac_feat,

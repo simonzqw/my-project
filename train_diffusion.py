@@ -129,7 +129,6 @@ def get_args():
 
     parser.add_argument('--timesteps', type=int, default=1000)
     parser.add_argument('--perturb_dim', type=int, default=200)
-    parser.add_argument('--cell_line_dim', type=int, default=32)
     parser.add_argument('--hidden_dims', type=int, nargs='+', default=[512, 512, 512])
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--dose_dim', type=int, default=32)
@@ -213,7 +212,7 @@ def train():
         atac_bank_path=args.atac_bank_path,
         background_key=args.background_key,
     )
-    n_genes, n_perts, n_cell_lines = processor.load_data()
+    n_genes, n_perts, _ = processor.load_data()
     train_loader, val_loader, test_loader = processor.prepare_loaders(
         batch_size=args.batch_size,
         rna_noise=0.0,
@@ -232,10 +231,8 @@ def train():
     model = PerturbationDiffusionPredictor(
         n_genes=n_genes,
         n_perturbations=n_perts,
-        n_cell_lines=n_cell_lines,
         pretrained_weights=pretrained_weights,
         perturb_dim=args.perturb_dim,
-        cell_line_dim=args.cell_line_dim,
         hidden_dims=args.hidden_dims,
         dropout=args.dropout,
         timesteps=args.timesteps,
@@ -288,7 +285,6 @@ def train():
             ctrl_rna = batch['rna_control'].to(device)
             target_rna = batch['rna_target'].to(device)
             perturb = batch['perturb'].to(device)
-            cell_line = batch['cell_line'].to(device)
             dose = batch['dose'].to(device) if 'dose' in batch else None
             atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
             drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
@@ -298,7 +294,6 @@ def train():
                 loss = model(
                     ctrl_rna,
                     perturb,
-                    cell_line,
                     target_rna=target_rna,
                     dose=dose,
                     atac_feat=atac_feat,
@@ -339,12 +334,11 @@ def train():
                 ctrl = batch['rna_control'].to(device)
                 target = batch['rna_target'].to(device)
                 perturb = batch['perturb'].to(device)
-                cell_line = batch['cell_line'].to(device)
                 dose = batch['dose'].to(device) if 'dose' in batch else None
                 atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
                 drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
                 t, weights = timestep_sampler.sample(ctrl.shape[0], device)
-                loss = model(ctrl, perturb, cell_line, target, dose=dose, atac_feat=atac_feat, drug_feat=drug_feat, t=t, weights=weights)
+                loss = model(ctrl, perturb, target, dose=dose, atac_feat=atac_feat, drug_feat=drug_feat, t=t, weights=weights)
                 val_loss += float(loss.item())
 
         val_metrics = []
@@ -356,7 +350,6 @@ def train():
                 ctrl = batch['rna_control'].to(device)
                 target = batch['rna_target'].to(device)
                 perturb = batch['perturb'].to(device)
-                cell_line = batch['cell_line'].to(device)
                 dose = batch['dose'].to(device) if 'dose' in batch else None
                 atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
                 drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
@@ -364,7 +357,6 @@ def train():
                 pred = model.predict_single(
                     rna_control=ctrl,
                     perturb=perturb,
-                    cell_line=cell_line,
                     dose=dose,
                     atac_feat=atac_feat,
                     drug_feat=drug_feat,
@@ -387,11 +379,9 @@ def train():
             'args': args,
             'n_genes': n_genes,
             'n_perts': n_perts,
-            'n_cell_lines': n_cell_lines,
-            'cell_line_categories': processor.cell_line_categories,
             'perturb_categories': processor.perturb_categories,
-            'baselines': processor.cell_line_baselines,
-            'atac_baselines': processor.cell_line_atac_baselines,
+            'atac_dim': atac_dim,
+            'use_atac': bool(processor.atac_features is not None),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'scaler_state_dict': scaler.state_dict(),

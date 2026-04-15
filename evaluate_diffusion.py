@@ -180,7 +180,7 @@ def get_args():
     return parser.parse_args()
 
 
-def load_model_from_checkpoint(checkpoint, n_genes, n_perts, n_cell_lines, processor, device):
+def load_model_from_checkpoint(checkpoint, n_genes, n_perts, processor, device):
     ckpt_args = checkpoint.get('args', argparse.Namespace())
     pretrained_weights = None
 
@@ -200,10 +200,8 @@ def load_model_from_checkpoint(checkpoint, n_genes, n_perts, n_cell_lines, proce
     model = PerturbationDiffusionPredictor(
         n_genes=n_genes,
         n_perturbations=n_perts,
-        n_cell_lines=n_cell_lines,
         pretrained_weights=pretrained_weights,
         perturb_dim=getattr(ckpt_args, 'perturb_dim', state_dict_dim(checkpoint, 'perturb_embedding.weight', default=200)),
-        cell_line_dim=getattr(ckpt_args, 'cell_line_dim', state_dict_dim(checkpoint, 'cell_line_embedding.weight', default=32)),
         hidden_dims=getattr(ckpt_args, 'hidden_dims', [512, 512, 512]),
         dropout=getattr(ckpt_args, 'dropout', 0.1),
         timesteps=getattr(ckpt_args, 'timesteps', 1000),
@@ -249,7 +247,7 @@ def evaluate():
         atac_bank_path=args.atac_bank_path if args.atac_bank_path is not None else getattr(ckpt_args, 'atac_bank_path', None),
         background_key=args.background_key if args.background_key is not None else getattr(ckpt_args, 'background_key', 'cell_context'),
     )
-    n_genes, n_perts, n_cell_lines = processor.load_data()
+    n_genes, n_perts, _ = processor.load_data()
     _, _, test_loader = processor.prepare_loaders(
         batch_size=args.batch_size,
         rna_noise=0.0,
@@ -258,7 +256,7 @@ def evaluate():
         background_key=args.background_key if args.background_key is not None else getattr(ckpt_args, 'background_key', 'cell_context'),
     )
 
-    model = load_model_from_checkpoint(checkpoint, n_genes, n_perts, n_cell_lines, processor, device)
+    model = load_model_from_checkpoint(checkpoint, n_genes, n_perts, processor, device)
     drug_embeddings = processor.drug_embeddings.to(device) if processor.drug_embeddings is not None else None
 
     sample_steps = args.sample_steps if args.sample_steps is not None else getattr(ckpt_args, 'sample_steps', 50)
@@ -271,7 +269,6 @@ def evaluate():
             ctrl = batch['rna_control'].to(device)
             target = batch['rna_target'].to(device)
             perturb = batch['perturb'].to(device)
-            cell_line = batch['cell_line'].to(device)
             dose = batch['dose'].to(device) if 'dose' in batch else None
             atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
             drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
@@ -279,7 +276,6 @@ def evaluate():
             pred = model.predict_single(
                 rna_control=ctrl,
                 perturb=perturb,
-                cell_line=cell_line,
                 dose=dose,
                 atac_feat=atac_feat,
                 drug_feat=drug_feat,

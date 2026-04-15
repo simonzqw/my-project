@@ -140,10 +140,8 @@ class PerturbationDiffusionPredictor(nn.Module):
         self,
         n_genes: int,
         n_perturbations: int,
-        n_cell_lines: int,
         pretrained_weights: Optional[torch.Tensor] = None,
         perturb_dim: int = 200,
-        cell_line_dim: int = 32,
         hidden_dims: Sequence[int] = (512, 512, 512),
         dropout: float = 0.1,
         timesteps: int = 1000,
@@ -158,7 +156,6 @@ class PerturbationDiffusionPredictor(nn.Module):
 
         self.n_genes = n_genes
         self.perturb_dim = perturb_dim
-        self.cell_line_dim = cell_line_dim
         self.dose_dim = dose_dim
         self.drug_dim = drug_dim
         self.use_atac = use_atac and (atac_dim > 0)
@@ -172,17 +169,11 @@ class PerturbationDiffusionPredictor(nn.Module):
         else:
             self.perturb_embedding = nn.Embedding(n_perturbations, perturb_dim)
 
-        self.cell_line_embedding = nn.Embedding(n_cell_lines, cell_line_dim)
-
         self.rna_projection = nn.Sequential(
             nn.Linear(n_genes, 512),
             nn.LayerNorm(512),
             nn.LeakyReLU(0.2),
             nn.Linear(512, perturb_dim),
-            nn.LayerNorm(perturb_dim),
-        )
-        self.cell_line_projection = nn.Sequential(
-            nn.Linear(cell_line_dim, perturb_dim),
             nn.LayerNorm(perturb_dim),
         )
         self.dose_projection = nn.Sequential(
@@ -294,7 +285,6 @@ class PerturbationDiffusionPredictor(nn.Module):
         self,
         rna_control: torch.Tensor,
         perturb: torch.Tensor,
-        cell_line: torch.Tensor,
         dose: Optional[torch.Tensor] = None,
         atac_feat: Optional[torch.Tensor] = None,
         drug_feat: Optional[torch.Tensor] = None,
@@ -305,8 +295,6 @@ class PerturbationDiffusionPredictor(nn.Module):
         if custom_latent is not None:
             return custom_latent
 
-        c_emb = self.cell_line_embedding(cell_line)
-        c_feat = self.cell_line_projection(c_emb).unsqueeze(1)
         rna_feat = self.rna_projection(rna_control).unsqueeze(1)
         dose = self._prepare_dose(batch_size, dose, rna_control)
         dose_feat = self.dose_projection(dose).unsqueeze(1)
@@ -314,7 +302,7 @@ class PerturbationDiffusionPredictor(nn.Module):
         p_emb = self._perturb_tokens(perturb, dose=dose)
         p_pooled = p_emb.mean(dim=1)
 
-        tokens = [rna_feat, p_emb, c_feat, dose_feat]
+        tokens = [rna_feat, p_emb, dose_feat]
         atac_token = None
         drug_token = None
 
@@ -334,10 +322,7 @@ class PerturbationDiffusionPredictor(nn.Module):
         attn_out, _ = self.feature_fusion(tokens, tokens, tokens)
         fused_feat = attn_out.mean(dim=1)
         fused_feat = self.fusion_norm(fused_feat + self.fusion_mlp(fused_feat))
-        joint_core = torch.cat(
-            [rna_feat.squeeze(1), p_pooled, c_feat.squeeze(1), dose_feat.squeeze(1)],
-            dim=1,
-        )
+        joint_core = torch.cat([rna_feat.squeeze(1), p_pooled, p_pooled, dose_feat.squeeze(1)], dim=1)
         joint_feat = self.semantic_joint_encoder(joint_core)
         if atac_token is not None:
             joint_feat = joint_feat + 0.5 * atac_token.squeeze(1)
@@ -352,7 +337,6 @@ class PerturbationDiffusionPredictor(nn.Module):
         self,
         rna_control: torch.Tensor,
         perturb: torch.Tensor,
-        cell_line: torch.Tensor,
         dose: Optional[torch.Tensor] = None,
         custom_latent: Optional[torch.Tensor] = None,
         atac_feat: Optional[torch.Tensor] = None,
@@ -363,7 +347,6 @@ class PerturbationDiffusionPredictor(nn.Module):
         z_sem = self.encode_semantic_latent(
             rna_control=rna_control,
             perturb=perturb,
-            cell_line=cell_line,
             dose=dose,
             atac_feat=atac_feat,
             drug_feat=drug_feat,
@@ -383,7 +366,6 @@ class PerturbationDiffusionPredictor(nn.Module):
         self,
         rna_control: torch.Tensor,
         perturb: torch.Tensor,
-        cell_line: torch.Tensor,
         dose: Optional[torch.Tensor] = None,
         atac_feat: Optional[torch.Tensor] = None,
         drug_feat: Optional[torch.Tensor] = None,
@@ -391,7 +373,6 @@ class PerturbationDiffusionPredictor(nn.Module):
         return self.encode_semantic_latent(
             rna_control=rna_control,
             perturb=perturb,
-            cell_line=cell_line,
             dose=dose,
             atac_feat=atac_feat,
             drug_feat=drug_feat,
@@ -456,7 +437,6 @@ class PerturbationDiffusionPredictor(nn.Module):
         self,
         rna_control: torch.Tensor,
         perturb: torch.Tensor,
-        cell_line: torch.Tensor,
         target_rna: Optional[torch.Tensor] = None,
         dose: Optional[torch.Tensor] = None,
         atac_feat: Optional[torch.Tensor] = None,
@@ -467,7 +447,6 @@ class PerturbationDiffusionPredictor(nn.Module):
         context = self.encode_context(
             rna_control=rna_control,
             perturb=perturb,
-            cell_line=cell_line,
             dose=dose,
             atac_feat=atac_feat,
             drug_feat=drug_feat,
@@ -486,7 +465,6 @@ class PerturbationDiffusionPredictor(nn.Module):
         self,
         rna_control: torch.Tensor,
         perturb: torch.Tensor,
-        cell_line: torch.Tensor,
         dose: Optional[torch.Tensor] = None,
         atac_feat: Optional[torch.Tensor] = None,
         drug_feat: Optional[torch.Tensor] = None,
@@ -496,7 +474,6 @@ class PerturbationDiffusionPredictor(nn.Module):
         return self.sample(
             rna_control=rna_control,
             perturb=perturb,
-            cell_line=cell_line,
             dose=dose,
             atac_feat=atac_feat,
             drug_feat=drug_feat,
@@ -508,7 +485,6 @@ class PerturbationDiffusionPredictor(nn.Module):
     def predict_from_latent(
         self,
         rna_control: torch.Tensor,
-        cell_line: torch.Tensor,
         latent: torch.Tensor,
         perturb: Optional[torch.Tensor] = None,
         dose: Optional[torch.Tensor] = None,
@@ -522,7 +498,6 @@ class PerturbationDiffusionPredictor(nn.Module):
         return self.sample(
             rna_control=rna_control,
             perturb=perturb,
-            cell_line=cell_line,
             dose=dose,
             custom_latent=latent,
             atac_feat=atac_feat,
@@ -536,7 +511,6 @@ class PerturbationDiffusionPredictor(nn.Module):
         self,
         rna_control: torch.Tensor,
         perturb: torch.Tensor,
-        cell_line: torch.Tensor,
         dose: Optional[torch.Tensor] = None,
         custom_latent: Optional[torch.Tensor] = None,
         atac_feat: Optional[torch.Tensor] = None,
@@ -547,7 +521,6 @@ class PerturbationDiffusionPredictor(nn.Module):
         context = self.encode_context(
             rna_control=rna_control,
             perturb=perturb,
-            cell_line=cell_line,
             dose=dose,
             custom_latent=custom_latent,
             atac_feat=atac_feat,
@@ -559,7 +532,6 @@ class PerturbationDiffusionPredictor(nn.Module):
             uncond_context = self.encode_context(
                 rna_control=rna_control,
                 perturb=perturb,
-                cell_line=cell_line,
                 dose=dose,
                 custom_latent=custom_latent,
                 atac_feat=atac_feat,
