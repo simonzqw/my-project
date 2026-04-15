@@ -47,6 +47,12 @@ def build_model(args, processor, ckpt, device):
         loader = GeneEmbeddingLoader(args.pretrained_emb, processor.id_to_perturb)
         pretrained_weights = loader.load_weights()
 
+    state_dict = ckpt["model_state_dict"]
+    if "drug_projection.0.weight" in state_dict:
+        inferred_drug_dim = int(state_dict["drug_projection.0.weight"].shape[1])
+    else:
+        inferred_drug_dim = 0
+
     atac_dim = int(np.load(os.path.join(args.context_dir, "mouse_atac_token.npy")).shape[0])
     model = PerturbationDiffusionPredictor(
         n_genes=processor.adata.n_vars,
@@ -58,24 +64,26 @@ def build_model(args, processor, ckpt, device):
         timesteps=getattr(ckpt_args, "timesteps", args.timesteps),
         dose_dim=getattr(ckpt_args, "dose_dim", args.dose_dim),
         time_dim=getattr(ckpt_args, "time_dim", args.time_dim),
-        drug_dim=(processor.drug_embeddings.shape[1] if processor.drug_embeddings is not None else args.drug_dim),
+        drug_dim=getattr(ckpt_args, "drug_dim", inferred_drug_dim),
         use_atac=True,
         atac_dim=atac_dim,
         cond_dropout=getattr(ckpt_args, "cond_dropout", args.cond_dropout),
     ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
     return model
 
 
 @torch.no_grad()
-def predict_one(model, processor, perturb_name, mouse_ctrl, mouse_atac, device, sample_steps, guidance_scale):
+def predict_one(model, processor, perturb_name, mouse_ctrl, mouse_atac, device, sample_steps, guidance_scale, drug_embeddings=None):
     pert_id = processor.perturb_map[perturb_name]
     perturb = torch.tensor([pert_id], dtype=torch.long, device=device)
+    drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
     pred = model.predict_single(
         rna_control=mouse_ctrl,
         perturb=perturb,
         atac_feat=mouse_atac,
+        drug_feat=drug_feat,
         sample_steps=sample_steps,
         guidance_scale=guidance_scale,
     )
@@ -92,6 +100,7 @@ def main():
     mouse_ctrl, mouse_atac = load_mouse_context(args.context_dir, device)
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     model = build_model(args, processor, ckpt, device)
+    drug_embeddings = processor.drug_embeddings.to(device) if processor.drug_embeddings is not None else None
 
     pert_list = args.perturbations
     if pert_list is None or len(pert_list) == 0:
@@ -111,6 +120,7 @@ def main():
             device,
             sample_steps=args.sample_steps,
             guidance_scale=args.guidance_scale,
+            drug_embeddings=drug_embeddings,
         ).astype(np.float32)
 
     out_npz = os.path.join(args.out_dir, "mouse_cross_species_preds.npz")
