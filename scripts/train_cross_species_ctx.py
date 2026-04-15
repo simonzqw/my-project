@@ -5,13 +5,14 @@ import numpy as np
 import torch
 import torch.optim as optim
 
-from models.reasoning_mlp import PerturbationPredictorNoCellLine
+from models.scerso_diffusion import PerturbationDiffusionPredictor
 from utils.data_processor import DataProcessor
+from utils.diffusion_schedule import LossSecondMomentResampler, UniformTimestepSampler
 from utils.emb_loader import GeneEmbeddingLoader
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train cross-species context model without cell_line token.")
+    p = argparse.ArgumentParser(description="Train cross-species diffusion model without cell_line token.")
     p.add_argument("--data_path", type=str, required=True)
     p.add_argument("--save_dir", type=str, required=True)
     p.add_argument("--pretrained_emb", type=str, default=None)
@@ -23,27 +24,29 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--amp", action="store_true")
-    p.add_argument("--context_dropout", type=float, default=0.15)
-    p.add_argument("--d_model", type=int, default=256)
-    p.add_argument("--nhead", type=int, default=8)
-    p.add_argument("--num_layers", type=int, default=4)
-    p.add_argument("--dim_ff", type=int, default=1024)
-    p.add_argument("--n_ctrl_tokens", type=int, default=8)
-    p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--perturb_dim", type=int, default=200)
-    p.add_argument("--hidden_dims", type=int, nargs="+", default=[512, 1024, 2048])
+    p.add_argument("--hidden_dims", type=int, nargs="+", default=[512, 512, 512])
+    p.add_argument("--timesteps", type=int, default=1000)
+    p.add_argument("--dose_dim", type=int, default=32)
+    p.add_argument("--time_dim", type=int, default=128)
+    p.add_argument("--cond_dropout", type=float, default=0.1)
+    p.add_argument("--sample_steps", type=int, default=50)
+    p.add_argument("--guidance_scale", type=float, default=1.2)
+    p.add_argument("--timestep_sampler", type=str, default="loss-second-moment", choices=["uniform", "loss-second-moment"])
     p.add_argument("--atac_key", type=str, default=None)
     p.add_argument("--atac_bank_path", type=str, default=None)
     p.add_argument("--background_key", type=str, default="cell_context")
     return p.parse_args()
 
 
-def run_epoch(model, loader, optimizer, scaler, device, context_dropout=0.0, drug_embeddings=None, train=True):
+def run_epoch(model, loader, optimizer, scaler, device, timestep_sampler, sample_steps, guidance_scale, drug_embeddings=None, train=True):
     if train:
         model.train()
     else:
         model.eval()
     losses = []
+    metric_mses = []
     for batch in loader:
         ctrl = batch["rna_control"].to(device)
         target = batch["rna_target"].to(device)
@@ -52,29 +55,45 @@ def run_epoch(model, loader, optimizer, scaler, device, context_dropout=0.0, dru
         atac_feat = batch["atac_feat"].to(device) if "atac_feat" in batch else None
         drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
 
-        if train and atac_feat is not None and context_dropout > 0:
-            keep = (torch.rand(atac_feat.shape[0], device=device) > context_dropout).float().unsqueeze(1)
-            atac_feat = atac_feat * keep
-
         with torch.set_grad_enabled(train):
-            with torch.amp.autocast("cuda", enabled=(train and scaler.is_enabled())):
-                pred = model(
+            if train:
+                t, weights = timestep_sampler.sample(ctrl.shape[0], device=device)
+            else:
+                t, weights = None, None
+            with torch.amp.autocast("cuda", enabled=scaler.is_enabled()):
+                loss = model(
                     rna_control=ctrl,
                     perturb=perturb,
-                    drug_feat=drug_feat,
+                    target_rna=target,
                     dose=dose,
                     atac_feat=atac_feat,
+                    drug_feat=drug_feat,
+                    t=t,
+                    weights=weights,
                 )
-                loss = ((pred - target) ** 2).mean()
 
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
+                timestep_sampler.update_with_losses(t, torch.full_like(t, float(loss.detach().item()), dtype=torch.float32))
+            else:
+                pred = model.predict_single(
+                    rna_control=ctrl,
+                    perturb=perturb,
+                    dose=dose,
+                    atac_feat=atac_feat,
+                    drug_feat=drug_feat,
+                    sample_steps=sample_steps,
+                    guidance_scale=guidance_scale,
+                )
+                metric_mses.append(float(torch.mean((pred - target) ** 2).detach().item()))
 
         losses.append(float(loss.detach().item()))
-    return float(np.mean(losses)) if len(losses) > 0 else 0.0
+    loss_mean = float(np.mean(losses)) if len(losses) > 0 else 0.0
+    metric_mse = float(np.mean(metric_mses)) if len(metric_mses) > 0 else 0.0
+    return loss_mean, metric_mse
 
 
 def main():
@@ -106,36 +125,62 @@ def main():
         pretrained_weights = loader.load_weights()
 
     atac_dim = processor.atac_dim if getattr(processor, "atac_features", None) is not None else 0
-    model = PerturbationPredictorNoCellLine(
+    model = PerturbationDiffusionPredictor(
         n_genes=n_genes,
         n_perturbations=n_perts,
         pretrained_weights=pretrained_weights,
         perturb_dim=args.perturb_dim,
         hidden_dims=args.hidden_dims,
         dropout=args.dropout,
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_layers=args.num_layers,
-        dim_ff=args.dim_ff,
-        n_ctrl_tokens=args.n_ctrl_tokens,
+        timesteps=args.timesteps,
+        dose_dim=args.dose_dim,
+        time_dim=args.time_dim,
+        drug_dim=(processor.drug_embeddings.shape[1] if processor.drug_embeddings is not None else 0),
+        use_atac=(processor.atac_features is not None),
         atac_dim=atac_dim,
+        cond_dropout=args.cond_dropout,
     ).to(device)
+
+    if args.timestep_sampler == "loss-second-moment":
+        timestep_sampler = LossSecondMomentResampler(args.timesteps)
+    else:
+        timestep_sampler = UniformTimestepSampler(args.timesteps)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=(args.amp and device.type == "cuda"))
     drug_embeddings = processor.drug_embeddings.to(device) if processor.drug_embeddings is not None else None
 
-    best_val = float("inf")
+    best_val_loss = float("inf")
+    best_val_pred_mse = float("inf")
     for epoch in range(1, args.epochs + 1):
-        train_loss = run_epoch(
-            model, train_loader, optimizer, scaler, device,
-            context_dropout=args.context_dropout, drug_embeddings=drug_embeddings, train=True
+        train_loss, _ = run_epoch(
+            model,
+            train_loader,
+            optimizer,
+            scaler,
+            device,
+            timestep_sampler=timestep_sampler,
+            sample_steps=args.sample_steps,
+            guidance_scale=args.guidance_scale,
+            drug_embeddings=drug_embeddings,
+            train=True,
         )
-        val_loss = run_epoch(
-            model, val_loader, optimizer, scaler, device,
-            context_dropout=0.0, drug_embeddings=drug_embeddings, train=False
+        val_loss, val_pred_mse = run_epoch(
+            model,
+            val_loader,
+            optimizer,
+            scaler,
+            device,
+            timestep_sampler=timestep_sampler,
+            sample_steps=args.sample_steps,
+            guidance_scale=args.guidance_scale,
+            drug_embeddings=drug_embeddings,
+            train=False,
         )
-        print(f"[E{epoch:03d}/{args.epochs:03d}] train={train_loss:.6f} val={val_loss:.6f}")
+        print(
+            f"[E{epoch:03d}/{args.epochs:03d}] "
+            f"train_diff_loss={train_loss:.6f} val_diff_loss={val_loss:.6f} val_pred_mse={val_pred_mse:.6f}"
+        )
 
         ckpt = {
             "model_state_dict": model.state_dict(),
@@ -143,15 +188,25 @@ def main():
             "n_genes": n_genes,
             "n_perts": n_perts,
             "perturb_categories": processor.perturb_categories,
-            "cell_line_categories": processor.cell_line_categories,
+            "atac_dim": atac_dim,
+            "use_atac": bool(processor.atac_features is not None),
+            "best_val_loss": best_val_loss,
+            "best_val_pred_mse": best_val_pred_mse,
+            "epoch": epoch,
         }
         torch.save(ckpt, os.path.join(args.save_dir, "latest.pth"))
-        if val_loss < best_val:
-            best_val = val_loss
-            torch.save(ckpt, os.path.join(args.save_dir, "best_model_ctx.pth"))
-            print(f"  ↳ best updated: val={best_val:.6f}")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            ckpt["best_val_loss"] = best_val_loss
+            torch.save(ckpt, os.path.join(args.save_dir, "best_model_ctx_diff.pth"))
+            print(f"  ↳ best diffusion loss updated: val_diff_loss={best_val_loss:.6f}")
+        if val_pred_mse < best_val_pred_mse:
+            best_val_pred_mse = val_pred_mse
+            ckpt["best_val_pred_mse"] = best_val_pred_mse
+            torch.save(ckpt, os.path.join(args.save_dir, "best_model_ctx_diff_predmse.pth"))
+            print(f"  ↳ best prediction mse updated: val_pred_mse={best_val_pred_mse:.6f}")
 
-    print(f">>> done. checkpoints in {args.save_dir}")
+    print(f">>> done. diffusion checkpoints in {args.save_dir}")
 
 
 if __name__ == "__main__":

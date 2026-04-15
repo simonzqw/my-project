@@ -5,7 +5,7 @@ import os
 import numpy as np
 import torch
 
-from models.reasoning_mlp import PerturbationPredictorNoCellLine
+from models.scerso_diffusion import PerturbationDiffusionPredictor
 from utils.data_processor import DataProcessor
 from utils.emb_loader import GeneEmbeddingLoader
 
@@ -21,13 +21,14 @@ def parse_args():
     p.add_argument("--split_strategy", type=str, default="perturbation")
     p.add_argument("--perturb_dim", type=int, default=200)
     p.add_argument("--drug_dim", type=int, default=2048)
-    p.add_argument("--hidden_dims", type=int, nargs="+", default=[512, 1024, 2048])
-    p.add_argument("--dropout", type=float, default=0.2)
-    p.add_argument("--d_model", type=int, default=256)
-    p.add_argument("--nhead", type=int, default=8)
-    p.add_argument("--num_layers", type=int, default=4)
-    p.add_argument("--dim_ff", type=int, default=1024)
-    p.add_argument("--n_ctrl_tokens", type=int, default=8)
+    p.add_argument("--hidden_dims", type=int, nargs="+", default=[512, 512, 512])
+    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--timesteps", type=int, default=1000)
+    p.add_argument("--dose_dim", type=int, default=32)
+    p.add_argument("--time_dim", type=int, default=128)
+    p.add_argument("--cond_dropout", type=float, default=0.0)
+    p.add_argument("--sample_steps", type=int, default=50)
+    p.add_argument("--guidance_scale", type=float, default=1.2)
     return p.parse_args()
 
 
@@ -40,37 +41,44 @@ def load_mouse_context(context_dir, device):
 
 
 def build_model(args, processor, ckpt, device):
+    ckpt_args = ckpt.get("args", argparse.Namespace())
     pretrained_weights = None
     if args.pretrained_emb:
         loader = GeneEmbeddingLoader(args.pretrained_emb, processor.id_to_perturb)
         pretrained_weights = loader.load_weights()
 
     atac_dim = int(np.load(os.path.join(args.context_dir, "mouse_atac_token.npy")).shape[0])
-    model = PerturbationPredictorNoCellLine(
+    model = PerturbationDiffusionPredictor(
         n_genes=processor.adata.n_vars,
         n_perturbations=len(processor.perturb_categories),
         pretrained_weights=pretrained_weights,
-        perturb_dim=args.perturb_dim,
-        drug_dim=args.drug_dim,
-        hidden_dims=args.hidden_dims,
-        dropout=args.dropout,
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_layers=args.num_layers,
-        dim_ff=args.dim_ff,
-        n_ctrl_tokens=args.n_ctrl_tokens,
+        perturb_dim=getattr(ckpt_args, "perturb_dim", args.perturb_dim),
+        hidden_dims=getattr(ckpt_args, "hidden_dims", args.hidden_dims),
+        dropout=getattr(ckpt_args, "dropout", args.dropout),
+        timesteps=getattr(ckpt_args, "timesteps", args.timesteps),
+        dose_dim=getattr(ckpt_args, "dose_dim", args.dose_dim),
+        time_dim=getattr(ckpt_args, "time_dim", args.time_dim),
+        drug_dim=(processor.drug_embeddings.shape[1] if processor.drug_embeddings is not None else args.drug_dim),
+        use_atac=True,
         atac_dim=atac_dim,
+        cond_dropout=getattr(ckpt_args, "cond_dropout", args.cond_dropout),
     ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    model.load_state_dict(ckpt["model_state_dict"], strict=True)
     model.eval()
     return model
 
 
 @torch.no_grad()
-def predict_one(model, processor, perturb_name, mouse_ctrl, mouse_atac, device):
+def predict_one(model, processor, perturb_name, mouse_ctrl, mouse_atac, device, sample_steps, guidance_scale):
     pert_id = processor.perturb_map[perturb_name]
     perturb = torch.tensor([pert_id], dtype=torch.long, device=device)
-    pred = model(rna_control=mouse_ctrl, perturb=perturb, atac_feat=mouse_atac)
+    pred = model.predict_single(
+        rna_control=mouse_ctrl,
+        perturb=perturb,
+        atac_feat=mouse_atac,
+        sample_steps=sample_steps,
+        guidance_scale=guidance_scale,
+    )
     return pred.squeeze(0).cpu().numpy()
 
 
@@ -94,7 +102,16 @@ def main():
         if p not in processor.perturb_map:
             print(f"skip unknown perturbation: {p}")
             continue
-        preds[p] = predict_one(model, processor, p, mouse_ctrl, mouse_atac, device).astype(np.float32)
+        preds[p] = predict_one(
+            model,
+            processor,
+            p,
+            mouse_ctrl,
+            mouse_atac,
+            device,
+            sample_steps=args.sample_steps,
+            guidance_scale=args.guidance_scale,
+        ).astype(np.float32)
 
     out_npz = os.path.join(args.out_dir, "mouse_cross_species_preds.npz")
     np.savez_compressed(out_npz, **preds)
