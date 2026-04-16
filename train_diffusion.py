@@ -116,7 +116,8 @@ def get_args():
     parser.add_argument('--save_dir', type=str, default='./checkpoints_diff')
     parser.add_argument('--pretrained_emb', type=str, default=None)
 
-    parser.add_argument('--split_strategy', type=str, default='perturbation', choices=['random', 'perturbation'])
+    parser.add_argument('--split_strategy', type=str, default='perturbation', choices=['random', 'perturbation', 'custom'])
+    parser.add_argument('--split_col', type=str, default='split')
     parser.add_argument('--test_size', type=float, default=0.1)
     parser.add_argument('--val_size', type=float, default=0.1)
 
@@ -208,6 +209,7 @@ def train():
         test_size=args.test_size,
         val_size=args.val_size,
         split_strategy=args.split_strategy,
+        split_col=args.split_col,
         atac_key=args.atac_key,
         atac_bank_path=args.atac_bank_path,
         background_key=args.background_key,
