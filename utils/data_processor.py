@@ -20,6 +20,7 @@ class DataProcessor:
         test_size=0.1,
         val_size=0.1,
         split_strategy='random',
+        split_col: str = 'split',
         atac_key: Optional[str] = None,
         atac_bank_path: Optional[str] = None,
         background_key: str = 'cell_context',
@@ -28,6 +29,7 @@ class DataProcessor:
         self.test_size = test_size
         self.val_size = val_size
         self.split_strategy = split_strategy
+        self.split_col = split_col
         self.atac_key = atac_key
         self.atac_bank_path = atac_bank_path
         self.background_key = background_key
@@ -282,7 +284,18 @@ class DataProcessor:
 
         indices = np.arange(self.adata.n_obs)
 
-        if self.split_strategy == 'perturbation':
+        if self.split_strategy == 'custom':
+            if self.split_col not in self.adata.obs:
+                raise ValueError(f"adata.obs 缺少自定义划分列: {self.split_col}")
+            split_values = self.adata.obs[self.split_col].astype(str).values
+            train_idx = np.where(split_values == 'train')[0]
+            val_idx = np.where(split_values == 'val')[0]
+            test_idx = np.where(split_values == 'test')[0]
+            print(f">>> 采用自定义划分策略: obs['{self.split_col}']")
+            print(f">>> 划分结果: train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}")
+            if len(train_idx) == 0 or len(val_idx) == 0 or len(test_idx) == 0:
+                raise ValueError(f"自定义划分列 {self.split_col} 中 train/val/test 至少有一个为空。")
+        elif self.split_strategy == 'perturbation':
             print(">>> 采用按扰动基因划分策略 (Zero-shot 分层模式)...")
             real_perts = [p for p in self.perturb_categories if p != 'control']
             np.random.seed(42)
@@ -311,15 +324,25 @@ class DataProcessor:
             train_idx, temp = train_test_split(indices, test_size=(self.val_size + self.test_size), random_state=42)
             val_idx, test_idx = train_test_split(temp, test_size=0.5, random_state=42)
 
-        control_pool_coarse = {}
-        control_pool_fine = {}
+        def build_control_pools(ctrl_indices):
+            control_pool_coarse = {}
+            control_pool_fine = {} if batch_ids is not None else None
+            for gidx in ctrl_indices:
+                c_id = int(cell_line_ids[gidx])
+                control_pool_coarse.setdefault(c_id, []).append(int(gidx))
+                if batch_ids is not None:
+                    b_id = int(batch_ids[gidx])
+                    control_pool_fine.setdefault((c_id, b_id), []).append(int(gidx))
+            return control_pool_coarse, control_pool_fine
+
         all_ctrl_idx = np.where(perturb_ids == control_id)[0] if control_id is not None else np.array([], dtype=np.int64)
-        for gidx in all_ctrl_idx:
-            c_id = int(cell_line_ids[gidx])
-            control_pool_coarse.setdefault(c_id, []).append(int(gidx))
-            if batch_ids is not None:
-                b_id = int(batch_ids[gidx])
-                control_pool_fine.setdefault((c_id, b_id), []).append(int(gidx))
+        train_ctrl_idx = np.intersect1d(train_idx, all_ctrl_idx)
+        val_ctrl_idx = np.intersect1d(val_idx, all_ctrl_idx)
+        test_ctrl_idx = np.intersect1d(test_idx, all_ctrl_idx)
+
+        train_control_pool_coarse, train_control_pool_fine = build_control_pools(train_ctrl_idx)
+        val_control_pool_coarse, val_control_pool_fine = build_control_pools(val_ctrl_idx)
+        test_control_pool_coarse, test_control_pool_fine = build_control_pools(test_ctrl_idx)
 
         if len(all_ctrl_idx) == 0:
             raise ValueError("未找到 control 样本，无法构建 control pool。")
@@ -358,9 +381,12 @@ class DataProcessor:
                 self.scale_rate = scale_rate
                 self.is_train = is_train
                 self.rng = np.random.RandomState(seed)
-                self.global_control_fallback = np.concatenate(
-                    [np.array(v, dtype=np.int64) for v in self.control_pool_coarse.values()]
-                )
+                if len(self.control_pool_coarse) > 0:
+                    self.global_control_fallback = np.concatenate(
+                        [np.array(v, dtype=np.int64) for v in self.control_pool_coarse.values()]
+                    )
+                else:
+                    self.global_control_fallback = np.array([], dtype=np.int64)
                 self.fixed_ctrl_idx = []
 
                 if not self.is_train:
@@ -420,6 +446,8 @@ class DataProcessor:
                         return self.control_pool_fine[key]
                 if c_id in self.control_pool_coarse and len(self.control_pool_coarse[c_id]) > 0:
                     return self.control_pool_coarse[c_id]
+                if self.global_control_fallback.size == 0:
+                    raise ValueError("当前 split 内不存在可用 control 样本，无法为非-control 样本匹配输入 control。")
                 return self.global_control_fallback
 
             def _get_rna_from_global(self, global_idx):
@@ -448,8 +476,8 @@ class DataProcessor:
             doses=train_doses,
             atac_feats=train_atac,
             control_id=control_id,
-            control_pool_coarse=control_pool_coarse,
-            control_pool_fine=control_pool_fine if batch_ids is not None else None,
+            control_pool_coarse=train_control_pool_coarse,
+            control_pool_fine=train_control_pool_fine if batch_ids is not None else None,
             local_batch_ids=train_local_batch,
             rna_noise=rna_noise,
             gene_mask_rate=gene_mask_rate,
@@ -465,8 +493,8 @@ class DataProcessor:
             doses=val_doses,
             atac_feats=val_atac,
             control_id=control_id,
-            control_pool_coarse=control_pool_coarse,
-            control_pool_fine=control_pool_fine if batch_ids is not None else None,
+            control_pool_coarse=val_control_pool_coarse,
+            control_pool_fine=val_control_pool_fine if batch_ids is not None else None,
             local_batch_ids=val_local_batch,
             is_train=False,
             seed=42,
@@ -479,8 +507,8 @@ class DataProcessor:
             doses=test_doses,
             atac_feats=test_atac,
             control_id=control_id,
-            control_pool_coarse=control_pool_coarse,
-            control_pool_fine=control_pool_fine if batch_ids is not None else None,
+            control_pool_coarse=test_control_pool_coarse,
+            control_pool_fine=test_control_pool_fine if batch_ids is not None else None,
             local_batch_ids=test_local_batch,
             is_train=False,
             seed=42,
