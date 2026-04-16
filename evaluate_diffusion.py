@@ -163,7 +163,8 @@ def get_args():
     parser.add_argument('--data_path', type=str, required=True)
     parser.add_argument('--model_path', type=str, required=True)
     parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--split_strategy', type=str, default='perturbation', choices=['random', 'perturbation'])
+    parser.add_argument('--split_strategy', type=str, default='perturbation', choices=['random', 'perturbation', 'custom'])
+    parser.add_argument('--split_col', type=str, default='split')
     parser.add_argument('--test_size', type=float, default=0.1)
     parser.add_argument('--val_size', type=float, default=0.1)
     parser.add_argument('--sample_steps', type=int, default=None)
@@ -243,6 +244,7 @@ def evaluate():
         test_size=args.test_size,
         val_size=args.val_size,
         split_strategy=args.split_strategy,
+        split_col=args.split_col,
         atac_key=args.atac_key if args.atac_key is not None else getattr(ckpt_args, 'atac_key', None),
         atac_bank_path=args.atac_bank_path if args.atac_bank_path is not None else getattr(ckpt_args, 'atac_bank_path', None),
         background_key=args.background_key if args.background_key is not None else getattr(ckpt_args, 'background_key', 'cell_context'),
