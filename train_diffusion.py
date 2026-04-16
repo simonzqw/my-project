@@ -30,6 +30,7 @@ def print_run_header(args, device):
     print(f"│ split:  {args.split_strategy:<60} │")
     print(f"│ steps:  t={args.timesteps}, sample={args.sample_steps}, sampler={args.timestep_sampler:<24} │")
     print(f"│ cfg:    scale={args.guidance_scale:.2f}, cond_dropout={args.cond_dropout:.2f}, amp={str(args.amp):<15} │")
+    print(f"│ early:  metric={args.early_stop_metric:<16} (w_d={args.score_w_delta:.2f}, w_p={args.score_w_top20p:.2f}, w_m={args.score_w_top20mse:.2f}) │")
     print(f"└{_hr('─', 70)}┘")
 
 
@@ -144,6 +145,10 @@ def get_args():
     parser.add_argument('--resume_path', type=str, default=None)
     parser.add_argument('--save_every_epoch', action='store_true')
     parser.add_argument('--keep_last_n', type=int, default=3)
+    parser.add_argument('--early_stop_metric', type=str, default='composite', choices=['composite', 'delta_pearson', 'top20_pearson'])
+    parser.add_argument('--score_w_delta', type=float, default=1.0)
+    parser.add_argument('--score_w_top20p', type=float, default=0.2)
+    parser.add_argument('--score_w_top20mse', type=float, default=0.02)
 
     parser.add_argument('--atac_key', type=str, default=None)
     parser.add_argument('--atac_bank_path', type=str, default=None)
@@ -260,6 +265,9 @@ def train():
 
     os.makedirs(args.save_dir, exist_ok=True)
     best_score = -float('inf')
+    best_top20_p = -float('inf')
+    best_delta_p = -float('inf')
+    best_top20_mse = float('inf')
     early_stopper = EarlyStopping(patience=args.patience)
     start_epoch = 0
 
@@ -275,6 +283,9 @@ def train():
         if 'ema_state_dict' in ckpt and ckpt['ema_state_dict'] is not None:
             ema.shadow = {k: v.to(device) for k, v in ckpt['ema_state_dict'].items()}
         best_score = ckpt.get('best_score', best_score)
+        best_top20_p = ckpt.get('best_top20_p', best_top20_p)
+        best_delta_p = ckpt.get('best_delta_p', best_delta_p)
+        best_top20_mse = ckpt.get('best_top20_mse', best_top20_mse)
         start_epoch = ckpt.get('epoch', -1) + 1
 
     for epoch in range(start_epoch, args.epochs):
@@ -374,7 +385,21 @@ def train():
         print_epoch_summary(epoch + 1, args.epochs, avg_train_loss, avg_val_loss, final_m)
 
         scheduler.step()
-        current_score = final_m.get('top20_pearson', 0.0)
+        top20_p = float(final_m.get('top20_pearson', 0.0))
+        delta_p = float(final_m.get('delta_pearson', 0.0))
+        top20_mse = float(final_m.get('top20_mse', 0.0))
+        composite_score = (
+            args.score_w_delta * delta_p
+            + args.score_w_top20p * top20_p
+            - args.score_w_top20mse * top20_mse
+        )
+
+        if args.early_stop_metric == 'delta_pearson':
+            current_score = delta_p
+        elif args.early_stop_metric == 'top20_pearson':
+            current_score = top20_p
+        else:
+            current_score = composite_score
 
         ckpt = {
             'model_state_dict': model.state_dict(),
@@ -389,14 +414,36 @@ def train():
             'scaler_state_dict': scaler.state_dict(),
             'ema_state_dict': ema.shadow,
             'best_score': best_score,
+            'best_top20_p': best_top20_p,
+            'best_delta_p': best_delta_p,
+            'best_top20_mse': best_top20_mse,
+            'composite_score': composite_score,
             'epoch': epoch,
         }
+
+        if top20_p > best_top20_p:
+            best_top20_p = top20_p
+            ckpt['best_top20_p'] = best_top20_p
+            torch.save(ckpt, os.path.join(args.save_dir, "best_model_top20p.pth"))
+            print(f"  ↳ New best top20_p: {best_top20_p:.4f}  saved=best_model_top20p.pth")
+
+        if delta_p > best_delta_p:
+            best_delta_p = delta_p
+            ckpt['best_delta_p'] = best_delta_p
+            torch.save(ckpt, os.path.join(args.save_dir, "best_model_delta.pth"))
+            print(f"  ↳ New best delta_p: {best_delta_p:.4f}  saved=best_model_delta.pth")
+
+        if top20_mse < best_top20_mse:
+            best_top20_mse = top20_mse
+            ckpt['best_top20_mse'] = best_top20_mse
+            torch.save(ckpt, os.path.join(args.save_dir, "best_model_mse.pth"))
+            print(f"  ↳ New best top20_mse: {best_top20_mse:.4f}  saved=best_model_mse.pth")
 
         if current_score > best_score:
             best_score = current_score
             ckpt['best_score'] = best_score
             torch.save(ckpt, os.path.join(args.save_dir, "best_model_diff.pth"))
-            print(f"  ↳ New best: top20_p={best_score:.4f}  saved=best_model_diff.pth")
+            print(f"  ↳ New best stop_metric({args.early_stop_metric})={best_score:.4f}  saved=best_model_diff.pth")
 
         torch.save(ckpt, os.path.join(args.save_dir, "latest.pth"))
         if args.save_every_epoch:
