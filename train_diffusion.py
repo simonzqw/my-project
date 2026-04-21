@@ -116,6 +116,7 @@ def get_args():
     parser.add_argument('--data_path', type=str, required=True)
     parser.add_argument('--save_dir', type=str, default='./checkpoints_diff')
     parser.add_argument('--pretrained_emb', type=str, default=None)
+    parser.add_argument('--preset', type=str, default='none', choices=['none', 'vnext', 'smoke'])
 
     parser.add_argument('--split_strategy', type=str, default='perturbation', choices=['random', 'perturbation', 'custom'])
     parser.add_argument('--split_col', type=str, default='split')
@@ -151,6 +152,10 @@ def get_args():
     parser.add_argument('--score_w_delta', type=float, default=1.0)
     parser.add_argument('--score_w_top20p', type=float, default=0.2)
     parser.add_argument('--score_w_top20mse', type=float, default=0.02)
+    parser.add_argument('--lambda_topde', type=float, default=0.0)
+    parser.add_argument('--lambda_delta_corr', type=float, default=0.0)
+    parser.add_argument('--lambda_centroid', type=float, default=0.0)
+    parser.add_argument('--topde_k', type=int, default=50)
 
     parser.add_argument('--atac_key', type=str, default=None)
     parser.add_argument('--atac_bank_path', type=str, default=None)
@@ -162,6 +167,78 @@ def get_args():
     parser.add_argument('--control_prototype_temp', type=float, default=1.0)
 
     return parser.parse_args()
+
+
+def apply_preset(args):
+    if args.preset == 'none':
+        return args
+
+    base_defaults = {
+        'split_strategy': 'perturbation',
+        'split_col': 'split',
+        'perturb_parse_mode': 'raw',
+        'batch_size': 512,
+        'epochs': 50,
+        'target_mode': 'delta',
+        'timesteps': 1000,
+        'sample_steps': 50,
+        'timestep_sampler': 'uniform',
+        'cond_dropout': 0.0,
+        'val_sample_batches': 5,
+        'early_stop_metric': 'composite',
+        'score_w_delta': 1.0,
+        'score_w_top20p': 0.2,
+        'score_w_top20mse': 0.02,
+        'lambda_topde': 0.0,
+        'lambda_delta_corr': 0.0,
+        'lambda_centroid': 0.0,
+        'topde_k': 50,
+        'control_match_mode': 'random',
+        'control_match_k': 32,
+        'control_match_scope': 'global',
+        'control_prototype_mode': 'topk_weighted',
+        'control_prototype_temp': 1.0,
+    }
+
+    preset_updates = {
+        'vnext': {
+            'split_strategy': 'custom',
+            'timestep_sampler': 'loss-second-moment',
+            'cond_dropout': 0.1,
+            'val_sample_batches': 0,
+            'control_match_mode': 'atac_knn',
+            'control_match_k': 16,
+            'control_match_scope': 'global',
+            'control_prototype_mode': 'topk_weighted',
+            'control_prototype_temp': 1.0,
+            'lambda_topde': 0.5,
+            'lambda_delta_corr': 0.2,
+            'lambda_centroid': 0.2,
+        },
+        'smoke': {
+            'split_strategy': 'custom',
+            'epochs': 3,
+            'timesteps': 200,
+            'sample_steps': 20,
+            'batch_size': 64,
+            'timestep_sampler': 'uniform',
+            'cond_dropout': 0.1,
+            'val_sample_batches': 0,
+            'control_match_mode': 'atac_knn',
+            'control_match_k': 8,
+            'control_match_scope': 'global',
+            'control_prototype_mode': 'topk_weighted',
+            'lambda_topde': 0.2,
+            'lambda_delta_corr': 0.1,
+            'lambda_centroid': 0.1,
+        },
+    }[args.preset]
+
+    for k, v in preset_updates.items():
+        if hasattr(args, k) and getattr(args, k) == base_defaults.get(k, None):
+            setattr(args, k, v)
+
+    return args
 
 
 def safe_pearson(x, y):
@@ -212,7 +289,7 @@ def calculate_metrics(pred, target, ctrl, top_k=(10, 20, 50)):
 
 
 def train():
-    args = get_args()
+    args = apply_preset(get_args())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print_run_header(args, device)
 
@@ -318,16 +395,64 @@ def train():
             t, weights = timestep_sampler.sample(ctrl_rna.shape[0], device)
 
             with torch.amp.autocast("cuda", enabled=(args.amp and device.type == "cuda")):
-                loss = model(
-                    ctrl_rna,
-                    perturb,
-                    target_rna=target_rna,
-                    dose=dose,
-                    atac_feat=atac_feat,
-                    drug_feat=drug_feat,
-                    t=t,
-                    weights=weights,
-                )
+                use_aux = (args.lambda_topde > 0) or (args.lambda_delta_corr > 0) or (args.lambda_centroid > 0)
+                if use_aux:
+                    diff_loss, details = model(
+                        ctrl_rna,
+                        perturb,
+                        target_rna=target_rna,
+                        dose=dose,
+                        atac_feat=atac_feat,
+                        drug_feat=drug_feat,
+                        t=t,
+                        weights=weights,
+                        return_details=True,
+                    )
+                    pred_target = details['pred_target']
+                    true_target = details['target_target']
+                    delta_pred = pred_target - ctrl_rna
+                    delta_true = true_target - ctrl_rna
+
+                    aux_loss = torch.tensor(0.0, device=ctrl_rna.device)
+                    if args.lambda_topde > 0:
+                        k = min(args.topde_k, delta_true.shape[1])
+                        top_idx = torch.topk(delta_true.abs(), k=k, dim=1).indices
+                        top_pred = torch.gather(delta_pred, 1, top_idx)
+                        top_true = torch.gather(delta_true, 1, top_idx)
+                        aux_loss = aux_loss + args.lambda_topde * torch.mean((top_pred - top_true) ** 2)
+
+                    if args.lambda_delta_corr > 0:
+                        cos = torch.nn.functional.cosine_similarity(delta_pred, delta_true, dim=1)
+                        aux_loss = aux_loss + args.lambda_delta_corr * torch.mean(1.0 - cos)
+
+                    if args.lambda_centroid > 0:
+                        centroid_loss = torch.tensor(0.0, device=ctrl_rna.device)
+                        uniq = torch.unique(perturb)
+                        counted = 0
+                        for pid in uniq:
+                            mask = (perturb == pid)
+                            if mask.sum() < 2:
+                                continue
+                            dpm = delta_pred[mask].mean(dim=0)
+                            dtm = delta_true[mask].mean(dim=0)
+                            centroid_loss = centroid_loss + torch.mean((dpm - dtm) ** 2)
+                            counted += 1
+                        if counted > 0:
+                            centroid_loss = centroid_loss / counted
+                        aux_loss = aux_loss + args.lambda_centroid * centroid_loss
+
+                    loss = diff_loss + aux_loss
+                else:
+                    loss = model(
+                        ctrl_rna,
+                        perturb,
+                        target_rna=target_rna,
+                        dose=dose,
+                        atac_feat=atac_feat,
+                        drug_feat=drug_feat,
+                        t=t,
+                        weights=weights,
+                    )
 
             scaler.scale(loss / args.accum_steps).backward()
 

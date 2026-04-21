@@ -244,10 +244,41 @@ class PerturbationDiffusionPredictor(nn.Module):
             nn.Sigmoid(),
         )
 
-        self.context_dim = n_genes + perturb_dim
+        self.background_encoder = nn.Sequential(
+            nn.Linear(perturb_dim * 2, perturb_dim),
+            nn.LayerNorm(perturb_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(perturb_dim, perturb_dim),
+            nn.LayerNorm(perturb_dim),
+        )
+        self.perturbation_encoder = nn.Sequential(
+            nn.Linear(perturb_dim * 3, perturb_dim),
+            nn.LayerNorm(perturb_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(perturb_dim, perturb_dim),
+            nn.LayerNorm(perturb_dim),
+        )
+        self.effect_composer = nn.Sequential(
+            nn.Linear(perturb_dim * 2, perturb_dim),
+            nn.LayerNorm(perturb_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(perturb_dim, perturb_dim),
+            nn.LayerNorm(perturb_dim),
+        )
+        self.effect_gate = nn.Sequential(
+            nn.Linear(perturb_dim * 2, perturb_dim),
+            nn.SiLU(),
+            nn.Linear(perturb_dim, perturb_dim),
+            nn.Sigmoid(),
+        )
+
+        self.context_dim = n_genes + perturb_dim * 2
         self.denoise_fn = SquidiffStyleDecoder(
             input_dim=n_genes,
-            latent_dim=perturb_dim,
+            latent_dim=perturb_dim * 2,
             hidden_dims=hidden_dims,
             dropout=dropout,
             time_dim=time_dim,
@@ -285,6 +316,48 @@ class PerturbationDiffusionPredictor(nn.Module):
                 p_emb = p_emb * (1.0 + dose.unsqueeze(-1))
         return p_emb
 
+    def encode_background(
+        self,
+        rna_control: torch.Tensor,
+        atac_feat: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        rna_feat = self.rna_projection(rna_control)
+        if self.atac_projection is not None and atac_feat is not None:
+            if atac_feat.dim() == 1:
+                atac_feat = atac_feat.unsqueeze(0)
+            atac_token = self.atac_projection(atac_feat)
+        else:
+            atac_token = torch.zeros_like(rna_feat)
+        z_bg = self.background_encoder(torch.cat([rna_feat, atac_token], dim=1))
+        return z_bg
+
+    def encode_perturbation(
+        self,
+        perturb: torch.Tensor,
+        dose: Optional[torch.Tensor] = None,
+        drug_feat: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch_size = perturb.shape[0]
+        p_emb = self._perturb_tokens(perturb, dose=dose)
+        p_pooled = p_emb.mean(dim=1)
+        ref = p_pooled
+        dose = self._prepare_dose(batch_size, dose, ref)
+        dose_feat = self.dose_projection(dose)
+        if self.drug_projection is not None and drug_feat is not None:
+            if drug_feat.dim() == 1:
+                drug_feat = drug_feat.unsqueeze(0)
+            drug_token = self.drug_projection(drug_feat)
+        else:
+            drug_token = torch.zeros_like(p_pooled)
+        z_pert = self.perturbation_encoder(torch.cat([p_pooled, dose_feat, drug_token], dim=1))
+        return z_pert
+
+    def compose_effect(self, z_bg: torch.Tensor, z_pert: torch.Tensor) -> torch.Tensor:
+        composed = self.effect_composer(torch.cat([z_bg, z_pert], dim=1))
+        gate = self.effect_gate(torch.cat([z_bg, z_pert], dim=1))
+        z_eff = gate * composed + (1.0 - gate) * z_pert
+        return z_eff
+
     def encode_semantic_latent(
         self,
         rna_control: torch.Tensor,
@@ -294,48 +367,12 @@ class PerturbationDiffusionPredictor(nn.Module):
         drug_feat: Optional[torch.Tensor] = None,
         custom_latent: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        batch_size = rna_control.shape[0]
-
         if custom_latent is not None:
             return custom_latent
-
-        rna_feat = self.rna_projection(rna_control).unsqueeze(1)
-        dose = self._prepare_dose(batch_size, dose, rna_control)
-        dose_feat = self.dose_projection(dose).unsqueeze(1)
-
-        p_emb = self._perturb_tokens(perturb, dose=dose)
-        p_pooled = p_emb.mean(dim=1)
-
-        tokens = [rna_feat, p_emb, dose_feat]
-        atac_token = None
-        drug_token = None
-
-        if self.atac_projection is not None and atac_feat is not None:
-            if atac_feat.dim() == 1:
-                atac_feat = atac_feat.unsqueeze(0)
-            atac_token = self.atac_projection(atac_feat).unsqueeze(1)
-            tokens.append(atac_token)
-
-        if self.drug_projection is not None and drug_feat is not None:
-            if drug_feat.dim() == 1:
-                drug_feat = drug_feat.unsqueeze(0)
-            drug_token = self.drug_projection(drug_feat).unsqueeze(1)
-            tokens.append(drug_token)
-
-        tokens = torch.cat(tokens, dim=1)
-        attn_out, _ = self.feature_fusion(tokens, tokens, tokens)
-        fused_feat = attn_out.mean(dim=1)
-        fused_feat = self.fusion_norm(fused_feat + self.fusion_mlp(fused_feat))
-        joint_core = torch.cat([rna_feat.squeeze(1), p_pooled, p_pooled, dose_feat.squeeze(1)], dim=1)
-        joint_feat = self.semantic_joint_encoder(joint_core)
-        if atac_token is not None:
-            joint_feat = joint_feat + 0.5 * atac_token.squeeze(1)
-        if drug_token is not None:
-            joint_feat = joint_feat + 0.5 * drug_token.squeeze(1)
-
-        blend_gate = self.semantic_blend_gate(torch.cat([fused_feat, joint_feat], dim=1))
-        z_sem = blend_gate * fused_feat + (1.0 - blend_gate) * joint_feat
-        return z_sem
+        z_bg = self.encode_background(rna_control=rna_control, atac_feat=atac_feat)
+        z_pert = self.encode_perturbation(perturb=perturb, dose=dose, drug_feat=drug_feat)
+        z_eff = self.compose_effect(z_bg=z_bg, z_pert=z_pert)
+        return z_eff
 
     def encode_context(
         self,
@@ -348,6 +385,10 @@ class PerturbationDiffusionPredictor(nn.Module):
         force_uncond: bool = False,
     ) -> torch.Tensor:
         batch_size = rna_control.shape[0]
+        z_bg = self.encode_background(
+            rna_control=rna_control,
+            atac_feat=atac_feat,
+        )
         z_sem = self.encode_semantic_latent(
             rna_control=rna_control,
             perturb=perturb,
@@ -359,11 +400,13 @@ class PerturbationDiffusionPredictor(nn.Module):
 
         if force_uncond:
             z_sem = torch.zeros_like(z_sem)
+            z_bg = torch.zeros_like(z_bg)
         elif self.training and self.cond_dropout > 0:
             keep = (torch.rand(batch_size, 1, device=rna_control.device) > self.cond_dropout).to(rna_control.dtype)
             z_sem = z_sem * keep
+            z_bg = z_bg * keep
 
-        context = torch.cat([rna_control, z_sem], dim=1)
+        context = torch.cat([rna_control, z_bg, z_sem], dim=1)
         return context
 
     def get_latent(
@@ -447,6 +490,7 @@ class PerturbationDiffusionPredictor(nn.Module):
         drug_feat: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
         weights: Optional[torch.Tensor] = None,
+        return_details: bool = False,
     ) -> Optional[torch.Tensor]:
         context = self.encode_context(
             rna_control=rna_control,
@@ -465,8 +509,23 @@ class PerturbationDiffusionPredictor(nn.Module):
 
         if t is None:
             t = torch.randint(0, self.diffusion.timesteps, (target_rna.shape[0],), device=target_rna.device).long()
-        loss = self.diffusion.p_losses(x_start=target_for_diffusion, t=t, context=context, weights=weights)
-        return loss
+        diff_out = self.diffusion.p_losses(
+            x_start=target_for_diffusion,
+            t=t,
+            context=context,
+            weights=weights,
+            return_details=return_details,
+        )
+        if return_details:
+            loss, details = diff_out
+            if self.target_mode == "delta":
+                details['pred_target'] = details['pred_x0'] + rna_control
+                details['target_target'] = target_rna
+            else:
+                details['pred_target'] = details['pred_x0']
+                details['target_target'] = target_rna
+            return loss, details
+        return diff_out
 
     @torch.no_grad()
     def predict_single(
