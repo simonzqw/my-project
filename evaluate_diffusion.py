@@ -169,6 +169,7 @@ def get_args():
     parser.add_argument('--val_size', type=float, default=0.1)
     parser.add_argument('--sample_steps', type=int, default=None)
     parser.add_argument('--guidance_scale', type=float, default=None)
+    parser.add_argument('--target_mode', type=str, default=None, choices=['target', 'delta'])
     parser.add_argument('--use_ema', action='store_true')
     parser.add_argument('--output_json', type=str, default='diffusion_eval.json')
     parser.add_argument('--dropout_eps', type=float, default=1e-3)
@@ -178,10 +179,12 @@ def get_args():
     parser.add_argument('--atac_key', type=str, default=None)
     parser.add_argument('--atac_bank_path', type=str, default=None)
     parser.add_argument('--background_key', type=str, default='cell_context')
+    parser.add_argument('--control_match_mode', type=str, default='random', choices=['random', 'atac_knn'])
+    parser.add_argument('--control_match_k', type=int, default=32)
     return parser.parse_args()
 
 
-def load_model_from_checkpoint(checkpoint, n_genes, n_perts, processor, device):
+def load_model_from_checkpoint(checkpoint, n_genes, n_perts, processor, device, target_mode_override=None):
     ckpt_args = checkpoint.get('args', argparse.Namespace())
     pretrained_weights = None
 
@@ -206,6 +209,7 @@ def load_model_from_checkpoint(checkpoint, n_genes, n_perts, processor, device):
         hidden_dims=getattr(ckpt_args, 'hidden_dims', [512, 512, 512]),
         dropout=getattr(ckpt_args, 'dropout', 0.1),
         timesteps=getattr(ckpt_args, 'timesteps', 1000),
+        target_mode=(target_mode_override if target_mode_override is not None else getattr(ckpt_args, 'target_mode', 'target')),
         dose_dim=getattr(ckpt_args, 'dose_dim', 32),
         time_dim=getattr(ckpt_args, 'time_dim', 128),
         drug_dim=(processor.drug_embeddings.shape[1] if processor.drug_embeddings is not None else 0),
@@ -256,9 +260,11 @@ def evaluate():
         atac_key=args.atac_key if args.atac_key is not None else getattr(ckpt_args, 'atac_key', None),
         atac_bank_path=args.atac_bank_path if args.atac_bank_path is not None else getattr(ckpt_args, 'atac_bank_path', None),
         background_key=args.background_key if args.background_key is not None else getattr(ckpt_args, 'background_key', 'cell_context'),
+        control_match_mode=args.control_match_mode,
+        control_match_k=args.control_match_k,
     )
 
-    model = load_model_from_checkpoint(checkpoint, n_genes, n_perts, processor, device)
+    model = load_model_from_checkpoint(checkpoint, n_genes, n_perts, processor, device, target_mode_override=args.target_mode)
     drug_embeddings = processor.drug_embeddings.to(device) if processor.drug_embeddings is not None else None
 
     sample_steps = args.sample_steps if args.sample_steps is not None else getattr(ckpt_args, 'sample_steps', 50)

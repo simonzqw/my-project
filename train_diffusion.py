@@ -28,7 +28,7 @@ def print_run_header(args, device):
     print(f"│ device: {str(device):<60} │")
     print(f"│ data:   {args.data_path[:60]:<60} │")
     print(f"│ split:  {args.split_strategy:<60} │")
-    print(f"│ steps:  t={args.timesteps}, sample={args.sample_steps}, sampler={args.timestep_sampler:<24} │")
+    print(f"│ steps:  t={args.timesteps}, sample={args.sample_steps}, mode={args.target_mode:<6}, sampler={args.timestep_sampler:<15} │")
     print(f"│ cfg:    scale={args.guidance_scale:.2f}, cond_dropout={args.cond_dropout:.2f}, amp={str(args.amp):<15} │")
     print(f"│ early:  metric={args.early_stop_metric:<16} (w_d={args.score_w_delta:.2f}, w_p={args.score_w_top20p:.2f}, w_m={args.score_w_top20mse:.2f}) │")
     print(f"└{_hr('─', 70)}┘")
@@ -130,6 +130,7 @@ def get_args():
     parser.add_argument('--accum_steps', type=int, default=1)
 
     parser.add_argument('--timesteps', type=int, default=1000)
+    parser.add_argument('--target_mode', type=str, default='delta', choices=['target', 'delta'])
     parser.add_argument('--perturb_dim', type=int, default=200)
     parser.add_argument('--hidden_dims', type=int, nargs='+', default=[512, 512, 512])
     parser.add_argument('--dropout', type=float, default=0.1)
@@ -153,6 +154,8 @@ def get_args():
     parser.add_argument('--atac_key', type=str, default=None)
     parser.add_argument('--atac_bank_path', type=str, default=None)
     parser.add_argument('--background_key', type=str, default='cell_context')
+    parser.add_argument('--control_match_mode', type=str, default='random', choices=['random', 'atac_knn'])
+    parser.add_argument('--control_match_k', type=int, default=32)
 
     return parser.parse_args()
 
@@ -226,6 +229,8 @@ def train():
         atac_key=args.atac_key,
         atac_bank_path=args.atac_bank_path,
         background_key=args.background_key,
+        control_match_mode=args.control_match_mode,
+        control_match_k=args.control_match_k,
     )
 
     pretrained_weights = None
@@ -243,6 +248,7 @@ def train():
         hidden_dims=args.hidden_dims,
         dropout=args.dropout,
         timesteps=args.timesteps,
+        target_mode=args.target_mode,
         dose_dim=args.dose_dim,
         time_dim=args.time_dim,
         drug_dim=(processor.drug_embeddings.shape[1] if processor.drug_embeddings is not None else 0),

@@ -263,7 +263,9 @@ class DataProcessor:
         num_workers=4,
         atac_key=None,
         atac_bank_path=None,
-        background_key='cell_context'
+        background_key='cell_context',
+        control_match_mode='random',
+        control_match_k=32,
     ):
         if self.atac_features is None and (atac_key is not None or atac_bank_path is not None):
             self._prepare_atac_features(
@@ -351,6 +353,7 @@ class DataProcessor:
             def __init__(
                 self,
                 full_rna,
+                full_atac,
                 sample_indices,
                 p_ids,
                 c_ids,
@@ -365,8 +368,11 @@ class DataProcessor:
                 scale_rate=0.0,
                 is_train=True,
                 seed=42,
+                control_match_mode='random',
+                control_match_k=32,
             ):
                 self.full_rna = full_rna
+                self.full_atac = full_atac
                 self.sample_indices = sample_indices
                 self.p_ids = p_ids
                 self.c_ids = c_ids
@@ -381,6 +387,8 @@ class DataProcessor:
                 self.scale_rate = scale_rate
                 self.is_train = is_train
                 self.rng = np.random.RandomState(seed)
+                self.control_match_mode = control_match_mode
+                self.control_match_k = max(int(control_match_k), 1)
                 if len(self.control_pool_coarse) > 0:
                     self.global_control_fallback = np.concatenate(
                         [np.array(v, dtype=np.int64) for v in self.control_pool_coarse.values()]
@@ -392,12 +400,10 @@ class DataProcessor:
                 if not self.is_train:
                     for i in range(len(self.p_ids)):
                         p_id = int(self.p_ids[i])
-                        c_id = int(self.c_ids[i])
                         if p_id == self.control_id:
                             self.fixed_ctrl_idx.append(None)
                             continue
-                        candidates = self._get_control_candidates(i, c_id)
-                        self.fixed_ctrl_idx.append(int(self.rng.choice(candidates)))
+                        self.fixed_ctrl_idx.append(None)
 
             def __len__(self):
                 return len(self.p_ids)
@@ -414,9 +420,10 @@ class DataProcessor:
                     input_rna = target_rna.clone()
                 else:
                     if self.is_train:
-                        candidates = self._get_control_candidates(idx, c_id)
-                        ctrl_gidx = int(self.rng.choice(candidates))
+                        ctrl_gidx = self._sample_control_index(idx, c_id)
                     else:
+                        if self.fixed_ctrl_idx[idx] is None:
+                            self.fixed_ctrl_idx[idx] = self._sample_control_index(idx, c_id)
                         ctrl_gidx = self.fixed_ctrl_idx[idx]
                     input_rna = self._get_rna_from_global(ctrl_gidx)
 
@@ -450,6 +457,26 @@ class DataProcessor:
                     raise ValueError("当前 split 内不存在可用 control 样本，无法为非-control 样本匹配输入 control。")
                 return self.global_control_fallback
 
+            def _sample_control_index(self, local_idx, c_id):
+                candidates = self._get_control_candidates(local_idx, c_id)
+                if self.control_match_mode != 'atac_knn' or self.full_atac is None or len(candidates) <= 1:
+                    return int(self.rng.choice(candidates))
+
+                target_global_idx = int(self.sample_indices[local_idx])
+                target_atac = self.full_atac[target_global_idx]
+                if target_atac.dim() != 1:
+                    target_atac = target_atac.view(-1)
+                cand_idx_t = torch.as_tensor(candidates, dtype=torch.long)
+                cand_atac = self.full_atac[cand_idx_t]
+                dists = torch.sum((cand_atac - target_atac.unsqueeze(0)) ** 2, dim=1)
+                k = min(self.control_match_k, dists.shape[0])
+                if self.is_train and k > 1:
+                    topk_ids = torch.topk(dists, k=k, largest=False).indices.cpu().numpy()
+                    picked = int(self.rng.choice(topk_ids))
+                    return int(candidates[picked])
+                best = int(torch.argmin(dists).item())
+                return int(candidates[best])
+
             def _get_rna_from_global(self, global_idx):
                 row = self.full_rna[global_idx]
                 if issparse(row):
@@ -470,6 +497,7 @@ class DataProcessor:
 
         train_ds = GenerativeDataset(
             full_rna=X,
+            full_atac=self.atac_features,
             sample_indices=train_idx,
             p_ids=perturb_ids[train_idx],
             c_ids=cell_line_ids[train_idx],
@@ -484,9 +512,12 @@ class DataProcessor:
             scale_rate=scale_rate,
             is_train=True,
             seed=42,
+            control_match_mode=control_match_mode,
+            control_match_k=control_match_k,
         )
         val_ds = GenerativeDataset(
             full_rna=X,
+            full_atac=self.atac_features,
             sample_indices=val_idx,
             p_ids=perturb_ids[val_idx],
             c_ids=cell_line_ids[val_idx],
@@ -498,9 +529,12 @@ class DataProcessor:
             local_batch_ids=val_local_batch,
             is_train=False,
             seed=42,
+            control_match_mode=control_match_mode,
+            control_match_k=control_match_k,
         )
         test_ds = GenerativeDataset(
             full_rna=X,
+            full_atac=self.atac_features,
             sample_indices=test_idx,
             p_ids=perturb_ids[test_idx],
             c_ids=cell_line_ids[test_idx],
@@ -512,6 +546,8 @@ class DataProcessor:
             local_batch_ids=test_local_batch,
             is_train=False,
             seed=42,
+            control_match_mode=control_match_mode,
+            control_match_k=control_match_k,
         )
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)

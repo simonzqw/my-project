@@ -62,6 +62,7 @@ def build_model(args, processor, ckpt, device):
         hidden_dims=getattr(ckpt_args, "hidden_dims", args.hidden_dims),
         dropout=getattr(ckpt_args, "dropout", args.dropout),
         timesteps=getattr(ckpt_args, "timesteps", args.timesteps),
+        target_mode=getattr(ckpt_args, "target_mode", "target"),
         dose_dim=getattr(ckpt_args, "dose_dim", args.dose_dim),
         time_dim=getattr(ckpt_args, "time_dim", args.time_dim),
         drug_dim=getattr(ckpt_args, "drug_dim", inferred_drug_dim),

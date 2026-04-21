@@ -151,6 +151,7 @@ class PerturbationDiffusionPredictor(nn.Module):
         use_atac: bool = False,
         atac_dim: int = 0,
         cond_dropout: float = 0.0,
+        target_mode: str = "target",
     ):
         super().__init__()
 
@@ -161,6 +162,9 @@ class PerturbationDiffusionPredictor(nn.Module):
         self.use_atac = use_atac and (atac_dim > 0)
         self.atac_dim = atac_dim
         self.cond_dropout = cond_dropout
+        if target_mode not in {"target", "delta"}:
+            raise ValueError("target_mode 必须是 'target' 或 'delta'")
+        self.target_mode = target_mode
 
         if pretrained_weights is not None:
             self.perturb_embedding = nn.Embedding.from_pretrained(pretrained_weights, freeze=False)
@@ -455,9 +459,13 @@ class PerturbationDiffusionPredictor(nn.Module):
         if target_rna is None:
             return None
 
+        target_for_diffusion = target_rna
+        if self.target_mode == "delta":
+            target_for_diffusion = target_rna - rna_control
+
         if t is None:
             t = torch.randint(0, self.diffusion.timesteps, (target_rna.shape[0],), device=target_rna.device).long()
-        loss = self.diffusion.p_losses(x_start=target_rna, t=t, context=context, weights=weights)
+        loss = self.diffusion.p_losses(x_start=target_for_diffusion, t=t, context=context, weights=weights)
         return loss
 
     @torch.no_grad()
@@ -545,4 +553,6 @@ class PerturbationDiffusionPredictor(nn.Module):
             guidance_scale=guidance_scale,
             uncond_context=uncond_context,
         )
+        if self.target_mode == "delta":
+            generated_rna = rna_control + generated_rna
         return generated_rna

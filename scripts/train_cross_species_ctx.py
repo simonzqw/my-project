@@ -28,6 +28,7 @@ def parse_args():
     p.add_argument("--perturb_dim", type=int, default=200)
     p.add_argument("--hidden_dims", type=int, nargs="+", default=[512, 512, 512])
     p.add_argument("--timesteps", type=int, default=1000)
+    p.add_argument("--target_mode", type=str, default="delta", choices=["target", "delta"])
     p.add_argument("--dose_dim", type=int, default=32)
     p.add_argument("--time_dim", type=int, default=128)
     p.add_argument("--cond_dropout", type=float, default=0.1)
@@ -133,6 +134,7 @@ def main():
         hidden_dims=args.hidden_dims,
         dropout=args.dropout,
         timesteps=args.timesteps,
+        target_mode=args.target_mode,
         dose_dim=args.dose_dim,
         time_dim=args.time_dim,
         drug_dim=(processor.drug_embeddings.shape[1] if processor.drug_embeddings is not None else 0),
