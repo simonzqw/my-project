@@ -67,23 +67,26 @@ class SquidiffStyleDecoder(nn.Module):
     """
     Denoiser conditioned on:
     - x_t
-    - control expression profile
-    - semantic latent z_sem
+    - background latent z_bg
+    - perturbation-effect latent z_eff
 
     context layout:
-    [rna_control (n_genes), z_sem (latent_dim)]
+    [z_bg (bg_dim), z_eff (eff_dim)]
     """
     def __init__(
         self,
         input_dim: int,
-        latent_dim: int,
+        bg_dim: int,
+        eff_dim: int,
         hidden_dims: Sequence[int] = (512, 512, 512),
         dropout: float = 0.1,
         time_dim: int = 128,
     ):
         super().__init__()
         self.input_dim = input_dim
-        self.latent_dim = latent_dim
+        self.bg_dim = bg_dim
+        self.eff_dim = eff_dim
+        self.cond_dim = bg_dim + eff_dim
         self.time_dim = time_dim
 
         self.time_mlp = nn.Sequential(
@@ -99,8 +102,13 @@ class SquidiffStyleDecoder(nn.Module):
             nn.LayerNorm(first_dim),
             nn.SiLU(),
         )
-        self.ctrl_proj = nn.Sequential(
-            nn.Linear(input_dim, first_dim),
+        self.bg_proj = nn.Sequential(
+            nn.Linear(bg_dim, first_dim),
+            nn.LayerNorm(first_dim),
+            nn.SiLU(),
+        )
+        self.eff_proj = nn.Sequential(
+            nn.Linear(eff_dim, first_dim),
             nn.LayerNorm(first_dim),
             nn.SiLU(),
         )
@@ -108,21 +116,22 @@ class SquidiffStyleDecoder(nn.Module):
         blocks = []
         curr_dim = first_dim
         for h_dim in hidden_dims:
-            blocks.append(ConditionalResidualBlock(curr_dim, h_dim, time_dim=time_dim, latent_dim=latent_dim, dropout=dropout))
+            blocks.append(ConditionalResidualBlock(curr_dim, h_dim, time_dim=time_dim, latent_dim=self.cond_dim, dropout=dropout))
             curr_dim = h_dim
         self.blocks = nn.ModuleList(blocks)
 
         self.final = nn.Linear(curr_dim, input_dim)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        rna_control = context[:, : self.input_dim]
-        z_sem = context[:, self.input_dim : self.input_dim + self.latent_dim]
+        z_bg = context[:, : self.bg_dim]
+        z_eff = context[:, self.bg_dim : self.bg_dim + self.eff_dim]
+        cond = torch.cat([z_bg, z_eff], dim=1)
 
         t_emb = self.time_mlp(t)
-        h = self.x_proj(x) + self.ctrl_proj(rna_control)
+        h = self.x_proj(x) + self.bg_proj(z_bg) + self.eff_proj(z_eff)
 
         for block in self.blocks:
-            h = block(h, t_emb=t_emb, z_sem=z_sem)
+            h = block(h, t_emb=t_emb, z_sem=cond)
 
         return self.final(h)
 
@@ -275,10 +284,11 @@ class PerturbationDiffusionPredictor(nn.Module):
             nn.Sigmoid(),
         )
 
-        self.context_dim = n_genes + perturb_dim * 2
+        self.context_dim = perturb_dim * 2
         self.denoise_fn = SquidiffStyleDecoder(
             input_dim=n_genes,
-            latent_dim=perturb_dim * 2,
+            bg_dim=perturb_dim,
+            eff_dim=perturb_dim,
             hidden_dims=hidden_dims,
             dropout=dropout,
             time_dim=time_dim,
@@ -406,7 +416,7 @@ class PerturbationDiffusionPredictor(nn.Module):
             z_sem = z_sem * keep
             z_bg = z_bg * keep
 
-        context = torch.cat([rna_control, z_bg, z_sem], dim=1)
+        context = torch.cat([z_bg, z_sem], dim=1)
         return context
 
     def get_latent(
