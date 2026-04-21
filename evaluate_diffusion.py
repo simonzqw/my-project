@@ -165,6 +165,7 @@ def get_args():
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--split_strategy', type=str, default='perturbation', choices=['random', 'perturbation', 'custom'])
     parser.add_argument('--split_col', type=str, default='split')
+    parser.add_argument('--perturb_parse_mode', type=str, default='raw', choices=['raw', 'single_gene_suffix_clean', 'double_gene_parse'])
     parser.add_argument('--test_size', type=float, default=0.1)
     parser.add_argument('--val_size', type=float, default=0.1)
     parser.add_argument('--sample_steps', type=int, default=None)
@@ -181,6 +182,7 @@ def get_args():
     parser.add_argument('--background_key', type=str, default='cell_context')
     parser.add_argument('--control_match_mode', type=str, default='random', choices=['random', 'atac_knn'])
     parser.add_argument('--control_match_k', type=int, default=32)
+    parser.add_argument('--control_match_scope', type=str, default='global', choices=['global', 'cell_line'])
     return parser.parse_args()
 
 
@@ -249,6 +251,7 @@ def evaluate():
         val_size=args.val_size,
         split_strategy=args.split_strategy,
         split_col=args.split_col,
+        perturb_parse_mode=args.perturb_parse_mode,
         atac_key=args.atac_key if args.atac_key is not None else getattr(ckpt_args, 'atac_key', None),
         atac_bank_path=args.atac_bank_path if args.atac_bank_path is not None else getattr(ckpt_args, 'atac_bank_path', None),
         background_key=args.background_key if args.background_key is not None else getattr(ckpt_args, 'background_key', 'cell_context'),
@@ -262,6 +265,7 @@ def evaluate():
         background_key=args.background_key if args.background_key is not None else getattr(ckpt_args, 'background_key', 'cell_context'),
         control_match_mode=args.control_match_mode,
         control_match_k=args.control_match_k,
+        control_match_scope=args.control_match_scope,
     )
 
     model = load_model_from_checkpoint(checkpoint, n_genes, n_perts, processor, device, target_mode_override=args.target_mode)

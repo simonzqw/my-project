@@ -119,6 +119,7 @@ def get_args():
 
     parser.add_argument('--split_strategy', type=str, default='perturbation', choices=['random', 'perturbation', 'custom'])
     parser.add_argument('--split_col', type=str, default='split')
+    parser.add_argument('--perturb_parse_mode', type=str, default='raw', choices=['raw', 'single_gene_suffix_clean', 'double_gene_parse'])
     parser.add_argument('--test_size', type=float, default=0.1)
     parser.add_argument('--val_size', type=float, default=0.1)
 
@@ -156,6 +157,7 @@ def get_args():
     parser.add_argument('--background_key', type=str, default='cell_context')
     parser.add_argument('--control_match_mode', type=str, default='random', choices=['random', 'atac_knn'])
     parser.add_argument('--control_match_k', type=int, default=32)
+    parser.add_argument('--control_match_scope', type=str, default='global', choices=['global', 'cell_line'])
 
     return parser.parse_args()
 
@@ -218,6 +220,7 @@ def train():
         val_size=args.val_size,
         split_strategy=args.split_strategy,
         split_col=args.split_col,
+        perturb_parse_mode=args.perturb_parse_mode,
         atac_key=args.atac_key,
         atac_bank_path=args.atac_bank_path,
         background_key=args.background_key,
@@ -231,6 +234,7 @@ def train():
         background_key=args.background_key,
         control_match_mode=args.control_match_mode,
         control_match_k=args.control_match_k,
+        control_match_scope=args.control_match_scope,
     )
 
     pretrained_weights = None

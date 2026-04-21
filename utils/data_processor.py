@@ -21,6 +21,7 @@ class DataProcessor:
         val_size=0.1,
         split_strategy='random',
         split_col: str = 'split',
+        perturb_parse_mode: str = 'raw',
         atac_key: Optional[str] = None,
         atac_bank_path: Optional[str] = None,
         background_key: str = 'cell_context',
@@ -30,6 +31,7 @@ class DataProcessor:
         self.val_size = val_size
         self.split_strategy = split_strategy
         self.split_col = split_col
+        self.perturb_parse_mode = perturb_parse_mode
         self.atac_key = atac_key
         self.atac_bank_path = atac_bank_path
         self.background_key = background_key
@@ -78,12 +80,28 @@ class DataProcessor:
             self.adata.obs['smiles'] = self.adata.obs['SMILES']
 
         self.adata.obs['perturbation'] = self.adata.obs['perturbation'].astype(str)
-        if self.adata.obs['perturbation'].str.contains('_').any():
-            print(">>> 检测到扰动名称包含下划线，尝试清洗以匹配 side information...")
+        if self.perturb_parse_mode == 'single_gene_suffix_clean':
+            print(">>> perturb_parse_mode=single_gene_suffix_clean: 仅清理后缀噪声 (如 +ctrl / +control)")
             self.adata.obs['perturbation'] = self.adata.obs['perturbation'].apply(
-                lambda x: x.split('_')[0] if x != 'control' and '_' in str(x) else x
+                lambda x: str(x).replace('+control', '').replace('+ctrl', '') if str(x) != 'control' else 'control'
             )
-            print(f">>> 清洗后的扰动类别示例: {self.adata.obs['perturbation'].unique()[:5]}")
+        elif self.perturb_parse_mode == 'double_gene_parse':
+            print(">>> perturb_parse_mode=double_gene_parse: 解析双扰动标签，避免塌缩成 'double'")
+
+            def _parse_double(x):
+                x = str(x)
+                if x == 'control':
+                    return x
+                if x.startswith('double_'):
+                    parts = [p for p in x.split('_')[1:] if p]
+                    if len(parts) >= 2:
+                        a, b = sorted(parts[:2])
+                        return f"double|{a}+{b}"
+                return x
+
+            self.adata.obs['perturbation'] = self.adata.obs['perturbation'].apply(_parse_double)
+        else:
+            print(">>> perturb_parse_mode=raw: 保留原始 perturbation 字符串，不做下划线截断清洗。")
 
         self.adata.obs['perturbation'] = self.adata.obs['perturbation'].astype('category')
         self.perturb_categories = self.adata.obs['perturbation'].cat.categories.tolist()
@@ -266,6 +284,7 @@ class DataProcessor:
         background_key='cell_context',
         control_match_mode='random',
         control_match_k=32,
+        control_match_scope='cell_line',
     ):
         if self.atac_features is None and (atac_key is not None or atac_bank_path is not None):
             self._prepare_atac_features(
@@ -370,6 +389,7 @@ class DataProcessor:
                 seed=42,
                 control_match_mode='random',
                 control_match_k=32,
+                control_match_scope='cell_line',
             ):
                 self.full_rna = full_rna
                 self.full_atac = full_atac
@@ -389,6 +409,7 @@ class DataProcessor:
                 self.rng = np.random.RandomState(seed)
                 self.control_match_mode = control_match_mode
                 self.control_match_k = max(int(control_match_k), 1)
+                self.control_match_scope = control_match_scope
                 if len(self.control_pool_coarse) > 0:
                     self.global_control_fallback = np.concatenate(
                         [np.array(v, dtype=np.int64) for v in self.control_pool_coarse.values()]
@@ -446,6 +467,10 @@ class DataProcessor:
                 return item
 
             def _get_control_candidates(self, local_idx, c_id):
+                if self.control_match_scope == 'global':
+                    if self.global_control_fallback.size == 0:
+                        raise ValueError("当前 split 内不存在可用 control 样本（global 模式）。")
+                    return self.global_control_fallback
                 if self.local_batch_ids is not None and self.control_pool_fine is not None:
                     b_id = int(self.local_batch_ids[local_idx])
                     key = (c_id, b_id)
@@ -514,6 +539,7 @@ class DataProcessor:
             seed=42,
             control_match_mode=control_match_mode,
             control_match_k=control_match_k,
+            control_match_scope=control_match_scope,
         )
         val_ds = GenerativeDataset(
             full_rna=X,
@@ -531,6 +557,7 @@ class DataProcessor:
             seed=42,
             control_match_mode=control_match_mode,
             control_match_k=control_match_k,
+            control_match_scope=control_match_scope,
         )
         test_ds = GenerativeDataset(
             full_rna=X,
@@ -548,6 +575,7 @@ class DataProcessor:
             seed=42,
             control_match_mode=control_match_mode,
             control_match_k=control_match_k,
+            control_match_scope=control_match_scope,
         )
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
