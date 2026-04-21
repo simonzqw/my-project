@@ -75,7 +75,7 @@ class GaussianDiffusion(nn.Module):
         
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
-    def p_losses(self, x_start, t, context, noise=None, weights=None):
+    def p_losses(self, x_start, t, context, noise=None, weights=None, return_details=False):
         """
         Calculate loss for training
         """
@@ -100,7 +100,16 @@ class GaussianDiffusion(nn.Module):
         if weights is not None:
             loss = loss * weights
         loss = loss.mean()
-        return loss
+        if not return_details:
+            return loss
+
+        if self.objective == 'pred_x0':
+            pred_x0 = model_out
+        elif self.objective == 'pred_noise':
+            pred_x0 = self.predict_start_from_noise(x_noisy, t, model_out)
+        else:
+            pred_x0 = model_out
+        return loss, {'pred_x0': pred_x0, 'target_x0': x_start, 'x_noisy': x_noisy, 't': t}
 
     def model_predictions(self, x, t, context, guidance_scale=1.0, uncond_context=None):
         model_out = self.model(x, t, context)
