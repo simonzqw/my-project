@@ -220,9 +220,14 @@ def load_model_from_checkpoint(checkpoint, n_genes, n_perts, processor, device, 
         use_atac=(processor.atac_features is not None),
         atac_dim=atac_dim,
         cond_dropout=getattr(ckpt_args, 'cond_dropout', 0.0),
+        perturb_gene_vocab_size=len(getattr(processor, 'perturb_gene_vocab', []) or []),
     ).to(device)
 
-    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    missing, unexpected = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    if len(missing) > 0:
+        print(f">>> 提示: checkpoint 缺少以下参数（已用随机初始化兼容）: {missing[:8]}{' ...' if len(missing) > 8 else ''}")
+    if len(unexpected) > 0:
+        print(f">>> 提示: checkpoint 存在未使用参数: {unexpected[:8]}{' ...' if len(unexpected) > 8 else ''}")
     if getattr(get_args_cache, 'use_ema', False) and ('ema_state_dict' in checkpoint) and (checkpoint['ema_state_dict'] is not None):
         for name, p in model.named_parameters():
             if p.requires_grad and name in checkpoint['ema_state_dict']:
@@ -285,6 +290,10 @@ def evaluate():
             ctrl = batch['rna_control'].to(device)
             target = batch['rna_target'].to(device)
             perturb = batch['perturb'].to(device)
+            perturb_type = batch['perturb_type'].to(device) if 'perturb_type' in batch else None
+            perturb_gene_a = batch['perturb_gene_a'].to(device) if 'perturb_gene_a' in batch else None
+            perturb_gene_b = batch['perturb_gene_b'].to(device) if 'perturb_gene_b' in batch else None
+            has_second_gene = batch['has_second_gene'].to(device) if 'has_second_gene' in batch else None
             dose = batch['dose'].to(device) if 'dose' in batch else None
             atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
             drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
@@ -297,6 +306,10 @@ def evaluate():
                 drug_feat=drug_feat,
                 sample_steps=sample_steps,
                 guidance_scale=guidance_scale,
+                perturb_type=perturb_type,
+                perturb_gene_a=perturb_gene_a,
+                perturb_gene_b=perturb_gene_b,
+                has_second_gene=has_second_gene,
             )
             pred_np = pred.cpu().numpy()
             target_np = target.cpu().numpy()

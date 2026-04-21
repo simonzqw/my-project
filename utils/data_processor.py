@@ -39,6 +39,8 @@ class DataProcessor:
         self.adata = None
         self.perturb_map = None
         self.id_to_perturb = None
+        self.perturb_gene_vocab = None
+        self.perturb_gene_to_idx = None
         self.cell_line_map = None
         self.gene_to_idx = None
 
@@ -107,12 +109,79 @@ class DataProcessor:
         self.perturb_categories = self.adata.obs['perturbation'].cat.categories.tolist()
         self.perturb_map = {name: i for i, name in enumerate(self.perturb_categories)}
         self.id_to_perturb = {i: name for name, i in self.perturb_map.items()}
+        self._build_structured_perturbation_metadata()
 
         cell_line_col = 'cell_line' if 'cell_line' in self.adata.obs else 'source_batch'
         self.cell_line_col = cell_line_col
         self.adata.obs[cell_line_col] = self.adata.obs[cell_line_col].astype('category')
         self.cell_line_categories = self.adata.obs[cell_line_col].cat.categories.tolist()
         self.cell_line_map = {name: i for i, name in enumerate(self.cell_line_categories)}
+
+    @staticmethod
+    def _parse_perturbation_label(perturb_name: str):
+        name = str(perturb_name)
+        if name == 'control':
+            return 0, None, None, 0
+
+        if name.startswith('double|') and '+' in name:
+            payload = name.split('|', 1)[1]
+            parts = [p.strip() for p in payload.split('+') if p.strip()]
+            if len(parts) >= 2:
+                return 2, parts[0], parts[1], 1
+
+        if name.startswith('double_'):
+            parts = [p for p in name.split('_')[1:] if p]
+            if len(parts) >= 2:
+                a, b = sorted(parts[:2])
+                return 2, a, b, 1
+
+        cleaned = name.replace('+control', '').replace('+ctrl', '')
+        if '+' in cleaned:
+            parts = [p.strip() for p in cleaned.split('+') if p.strip() and p.strip() != 'control']
+            if len(parts) >= 2:
+                a, b = sorted(parts[:2])
+                return 2, a, b, 1
+            if len(parts) == 1:
+                return 1, parts[0], None, 0
+
+        return 1, cleaned, None, 0
+
+    def _build_structured_perturbation_metadata(self):
+        PAD_TOKEN = "__PAD__"
+        gene_set = set()
+        parsed_by_name = {}
+
+        for p_name in self.perturb_categories:
+            p_type, g_a, g_b, has_second = self._parse_perturbation_label(p_name)
+            parsed_by_name[p_name] = (p_type, g_a, g_b, has_second)
+            if g_a is not None:
+                gene_set.add(g_a)
+            if g_b is not None:
+                gene_set.add(g_b)
+
+        self.perturb_gene_vocab = [PAD_TOKEN] + sorted(gene_set)
+        self.perturb_gene_to_idx = {g: i for i, g in enumerate(self.perturb_gene_vocab)}
+        self.perturb_pad_idx = self.perturb_gene_to_idx[PAD_TOKEN]
+
+        per_type = np.zeros(self.adata.n_obs, dtype=np.int64)
+        per_a = np.full(self.adata.n_obs, self.perturb_pad_idx, dtype=np.int64)
+        per_b = np.full(self.adata.n_obs, self.perturb_pad_idx, dtype=np.int64)
+        per_has_second = np.zeros(self.adata.n_obs, dtype=np.int64)
+
+        per_name = self.adata.obs['perturbation'].astype(str).values
+        for i, p_name in enumerate(per_name):
+            p_type, g_a, g_b, has_second = parsed_by_name[p_name]
+            per_type[i] = p_type
+            per_a[i] = self.perturb_gene_to_idx.get(g_a, self.perturb_pad_idx) if g_a is not None else self.perturb_pad_idx
+            per_b[i] = self.perturb_gene_to_idx.get(g_b, self.perturb_pad_idx) if g_b is not None else self.perturb_pad_idx
+            per_has_second[i] = has_second
+
+        self.adata.obs['perturb_type'] = per_type
+        self.adata.obs['perturb_gene_a'] = per_a
+        self.adata.obs['perturb_gene_b'] = per_b
+        self.adata.obs['has_second_gene'] = per_has_second
+
+        print(f">>> structured perturbation vocab size: {len(self.perturb_gene_vocab)} (含 PAD)")
 
     def _prepare_drug_features(self):
         self.drug_embeddings = None
@@ -272,6 +341,26 @@ class DataProcessor:
         print(f">>> 数据加载完成: {self.adata.n_obs} 细胞, {self.adata.n_vars} 基因")
         return self.adata.n_vars, len(self.perturb_categories), len(self.cell_line_categories)
 
+    def encode_structured_perturbation_names(self, perturb_names):
+        if self.perturb_gene_to_idx is None:
+            raise ValueError("perturb_gene vocab 尚未初始化，请先调用 load_data()。")
+
+        p_type, p_a, p_b, p_has_second = [], [], [], []
+        pad_idx = self.perturb_pad_idx
+        for p_name in perturb_names:
+            t, g_a, g_b, has_second = self._parse_perturbation_label(str(p_name))
+            p_type.append(t)
+            p_a.append(self.perturb_gene_to_idx.get(g_a, pad_idx) if g_a is not None else pad_idx)
+            p_b.append(self.perturb_gene_to_idx.get(g_b, pad_idx) if g_b is not None else pad_idx)
+            p_has_second.append(has_second)
+
+        return {
+            'perturb_type': torch.tensor(p_type, dtype=torch.long),
+            'perturb_gene_a': torch.tensor(p_a, dtype=torch.long),
+            'perturb_gene_b': torch.tensor(p_b, dtype=torch.long),
+            'has_second_gene': torch.tensor(p_has_second, dtype=torch.long),
+        }
+
     def prepare_loaders(
         self,
         batch_size=2048,
@@ -297,6 +386,10 @@ class DataProcessor:
 
         X = self.adata.X
         perturb_ids = self.adata.obs['perturbation'].cat.codes.values
+        perturb_type_ids = self.adata.obs['perturb_type'].values.astype(np.int64)
+        perturb_gene_a_ids = self.adata.obs['perturb_gene_a'].values.astype(np.int64)
+        perturb_gene_b_ids = self.adata.obs['perturb_gene_b'].values.astype(np.int64)
+        perturb_has_second = self.adata.obs['has_second_gene'].values.astype(np.int64)
         cell_line_ids = self.adata.obs[self.cell_line_col].cat.codes.values
         control_id = self.perturb_map.get('control', None)
 
@@ -378,6 +471,10 @@ class DataProcessor:
                 sample_indices,
                 p_ids,
                 c_ids,
+                p_type_ids,
+                p_gene_a_ids,
+                p_gene_b_ids,
+                p_has_second,
                 doses,
                 atac_feats,
                 control_id,
@@ -400,6 +497,10 @@ class DataProcessor:
                 self.sample_indices = sample_indices
                 self.p_ids = p_ids
                 self.c_ids = c_ids
+                self.p_type_ids = p_type_ids
+                self.p_gene_a_ids = p_gene_a_ids
+                self.p_gene_b_ids = p_gene_b_ids
+                self.p_has_second = p_has_second
                 self.doses = doses
                 self.atac_feats = atac_feats
                 self.control_id = control_id
@@ -439,6 +540,10 @@ class DataProcessor:
                 target_rna = self._get_rna_from_global(self.sample_indices[idx])
                 c_id = int(self.c_ids[idx])
                 p_id = int(self.p_ids[idx])
+                p_type = int(self.p_type_ids[idx])
+                p_gene_a = int(self.p_gene_a_ids[idx])
+                p_gene_b = int(self.p_gene_b_ids[idx])
+                p_has_second = int(self.p_has_second[idx])
 
                 dose_val = self.doses[idx] if self.doses is not None else torch.tensor(0.0)
                 atac_val = self.atac_feats[idx] if self.atac_feats is not None else None
@@ -468,6 +573,10 @@ class DataProcessor:
                     'rna_control': input_rna,
                     'rna_target': target_rna,
                     'perturb': torch.tensor(p_id, dtype=torch.long),
+                    'perturb_type': torch.tensor(p_type, dtype=torch.long),
+                    'perturb_gene_a': torch.tensor(p_gene_a, dtype=torch.long),
+                    'perturb_gene_b': torch.tensor(p_gene_b, dtype=torch.long),
+                    'has_second_gene': torch.tensor(p_has_second, dtype=torch.long),
                     'cell_line': torch.tensor(c_id, dtype=torch.long),
                     'dose': dose_val,
                 }
@@ -563,6 +672,10 @@ class DataProcessor:
             sample_indices=train_idx,
             p_ids=perturb_ids[train_idx],
             c_ids=cell_line_ids[train_idx],
+            p_type_ids=perturb_type_ids[train_idx],
+            p_gene_a_ids=perturb_gene_a_ids[train_idx],
+            p_gene_b_ids=perturb_gene_b_ids[train_idx],
+            p_has_second=perturb_has_second[train_idx],
             doses=train_doses,
             atac_feats=train_atac,
             control_id=control_id,
@@ -586,6 +699,10 @@ class DataProcessor:
             sample_indices=val_idx,
             p_ids=perturb_ids[val_idx],
             c_ids=cell_line_ids[val_idx],
+            p_type_ids=perturb_type_ids[val_idx],
+            p_gene_a_ids=perturb_gene_a_ids[val_idx],
+            p_gene_b_ids=perturb_gene_b_ids[val_idx],
+            p_has_second=perturb_has_second[val_idx],
             doses=val_doses,
             atac_feats=val_atac,
             control_id=control_id,
@@ -606,6 +723,10 @@ class DataProcessor:
             sample_indices=test_idx,
             p_ids=perturb_ids[test_idx],
             c_ids=cell_line_ids[test_idx],
+            p_type_ids=perturb_type_ids[test_idx],
+            p_gene_a_ids=perturb_gene_a_ids[test_idx],
+            p_gene_b_ids=perturb_gene_b_ids[test_idx],
+            p_has_second=perturb_has_second[test_idx],
             doses=test_doses,
             atac_feats=test_atac,
             control_id=control_id,

@@ -127,8 +127,13 @@ def main():
         use_atac=(processor.atac_features is not None),
         atac_dim=config['atac_dim'],
         cond_dropout=config['cond_dropout'],
+        perturb_gene_vocab_size=len(getattr(processor, 'perturb_gene_vocab', []) or []),
     ).to(device)
-    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    missing, unexpected = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    if len(missing) > 0:
+        print(f">>> 提示: checkpoint 缺少以下参数（已用随机初始化兼容）: {missing[:8]}{' ...' if len(missing) > 8 else ''}")
+    if len(unexpected) > 0:
+        print(f">>> 提示: checkpoint 存在未使用参数: {unexpected[:8]}{' ...' if len(unexpected) > 8 else ''}")
     if 'ema_state_dict' in checkpoint and checkpoint['ema_state_dict'] is not None:
         for name, p in model.named_parameters():
             if p.requires_grad and name in checkpoint['ema_state_dict']:
@@ -154,12 +159,20 @@ def main():
         resolved_genes.append(resolved_gene)
         pid = processor.perturb_map[resolved_gene]
         perturb_ids.append(pid)
+        structured = processor.encode_structured_perturbation_names([resolved_gene])
         latent = model.get_latent(
             rna_control=control,
             perturb=torch.tensor([pid], dtype=torch.long, device=device),
             atac_feat=atac_feat,
+            perturb_type=structured['perturb_type'].to(device),
+            perturb_gene_a=structured['perturb_gene_a'].to(device),
+            perturb_gene_b=structured['perturb_gene_b'].to(device),
+            has_second_gene=structured['has_second_gene'].to(device),
         )
         latents.append(latent)
+
+    primary_structured = processor.encode_structured_perturbation_names([resolved_genes[0]])
+    primary_structured = {k: v.to(device) for k, v in primary_structured.items()}
 
     if len(latents) == 1:
         pred = model.predict_single(
@@ -168,6 +181,10 @@ def main():
             atac_feat=atac_feat,
             sample_steps=args.sample_steps,
             guidance_scale=args.guidance_scale,
+            perturb_type=primary_structured['perturb_type'],
+            perturb_gene_a=primary_structured['perturb_gene_a'],
+            perturb_gene_b=primary_structured['perturb_gene_b'],
+            has_second_gene=primary_structured['has_second_gene'],
         )
         latent_used = latents[0]
     else:
@@ -179,6 +196,10 @@ def main():
             atac_feat=atac_feat,
             sample_steps=args.sample_steps,
             guidance_scale=args.guidance_scale,
+            perturb_type=primary_structured['perturb_type'],
+            perturb_gene_a=primary_structured['perturb_gene_a'],
+            perturb_gene_b=primary_structured['perturb_gene_b'],
+            has_second_gene=primary_structured['has_second_gene'],
         )
 
     pred_np = pred.squeeze(0).detach().cpu().numpy()
@@ -220,10 +241,16 @@ def main():
         if interp_auto:
             print(f">>> 提示: interpolate_to={args.interpolate_to} 不存在，自动替换为 {interp_gene}")
         pid_to = processor.perturb_map[interp_gene]
+        interp_structured = processor.encode_structured_perturbation_names([interp_gene])
+        interp_structured = {k: v.to(device) for k, v in interp_structured.items()}
         latent_to = model.get_latent(
             rna_control=control,
             perturb=torch.tensor([pid_to], dtype=torch.long, device=device),
             atac_feat=atac_feat,
+            perturb_type=interp_structured['perturb_type'],
+            perturb_gene_a=interp_structured['perturb_gene_a'],
+            perturb_gene_b=interp_structured['perturb_gene_b'],
+            has_second_gene=interp_structured['has_second_gene'],
         )
         interp = model.interpolate_latents(latents[0], latent_to, steps=args.interp_steps)
         traj_preds = []
@@ -235,6 +262,10 @@ def main():
                 atac_feat=atac_feat,
                 sample_steps=args.sample_steps,
                 guidance_scale=args.guidance_scale,
+                perturb_type=primary_structured['perturb_type'],
+                perturb_gene_a=primary_structured['perturb_gene_a'],
+                perturb_gene_b=primary_structured['perturb_gene_b'],
+                has_second_gene=primary_structured['has_second_gene'],
             )
             traj_preds.append(p.squeeze(0).detach().cpu().numpy())
         traj_arr = np.stack(traj_preds, axis=0)
