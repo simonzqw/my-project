@@ -183,6 +183,8 @@ def get_args():
     parser.add_argument('--control_match_mode', type=str, default='random', choices=['random', 'atac_knn'])
     parser.add_argument('--control_match_k', type=int, default=32)
     parser.add_argument('--control_match_scope', type=str, default='global', choices=['global', 'cell_line'])
+    parser.add_argument('--control_prototype_mode', type=str, default='topk_weighted', choices=['single', 'topk_mean', 'topk_weighted'])
+    parser.add_argument('--control_prototype_temp', type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -266,6 +268,8 @@ def evaluate():
         control_match_mode=args.control_match_mode,
         control_match_k=args.control_match_k,
         control_match_scope=args.control_match_scope,
+        control_prototype_mode=args.control_prototype_mode,
+        control_prototype_temp=args.control_prototype_temp,
     )
 
     model = load_model_from_checkpoint(checkpoint, n_genes, n_perts, processor, device, target_mode_override=args.target_mode)

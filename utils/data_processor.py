@@ -285,6 +285,8 @@ class DataProcessor:
         control_match_mode='random',
         control_match_k=32,
         control_match_scope='cell_line',
+        control_prototype_mode='single',
+        control_prototype_temp=1.0,
     ):
         if self.atac_features is None and (atac_key is not None or atac_bank_path is not None):
             self._prepare_atac_features(
@@ -390,6 +392,8 @@ class DataProcessor:
                 control_match_mode='random',
                 control_match_k=32,
                 control_match_scope='cell_line',
+                control_prototype_mode='single',
+                control_prototype_temp=1.0,
             ):
                 self.full_rna = full_rna
                 self.full_atac = full_atac
@@ -410,6 +414,8 @@ class DataProcessor:
                 self.control_match_mode = control_match_mode
                 self.control_match_k = max(int(control_match_k), 1)
                 self.control_match_scope = control_match_scope
+                self.control_prototype_mode = control_prototype_mode
+                self.control_prototype_temp = max(float(control_prototype_temp), 1e-6)
                 if len(self.control_pool_coarse) > 0:
                     self.global_control_fallback = np.concatenate(
                         [np.array(v, dtype=np.int64) for v in self.control_pool_coarse.values()]
@@ -440,13 +446,16 @@ class DataProcessor:
                 if p_id == self.control_id:
                     input_rna = target_rna.clone()
                 else:
-                    if self.is_train:
-                        ctrl_gidx = self._sample_control_index(idx, c_id)
+                    if self.control_prototype_mode != 'single':
+                        input_rna = self._build_control_prototype(idx, c_id)
                     else:
-                        if self.fixed_ctrl_idx[idx] is None:
-                            self.fixed_ctrl_idx[idx] = self._sample_control_index(idx, c_id)
-                        ctrl_gidx = self.fixed_ctrl_idx[idx]
-                    input_rna = self._get_rna_from_global(ctrl_gidx)
+                        if self.is_train:
+                            ctrl_gidx = self._sample_control_index(idx, c_id)
+                        else:
+                            if self.fixed_ctrl_idx[idx] is None:
+                                self.fixed_ctrl_idx[idx] = self._sample_control_index(idx, c_id)
+                            ctrl_gidx = self.fixed_ctrl_idx[idx]
+                        input_rna = self._get_rna_from_global(ctrl_gidx)
 
                 if self.is_train:
                     if self.rna_noise > 0:
@@ -483,9 +492,19 @@ class DataProcessor:
                 return self.global_control_fallback
 
             def _sample_control_index(self, local_idx, c_id):
+                ranked_candidates, ranked_dists = self._rank_control_candidates(local_idx, c_id)
+                if ranked_dists is None:
+                    return int(self.rng.choice(ranked_candidates))
+                k = min(self.control_match_k, len(ranked_candidates))
+                if self.is_train and k > 1:
+                    return int(self.rng.choice(ranked_candidates[:k]))
+                return int(ranked_candidates[0])
+
+            def _rank_control_candidates(self, local_idx, c_id):
                 candidates = self._get_control_candidates(local_idx, c_id)
+                candidates = np.asarray(candidates, dtype=np.int64)
                 if self.control_match_mode != 'atac_knn' or self.full_atac is None or len(candidates) <= 1:
-                    return int(self.rng.choice(candidates))
+                    return candidates.tolist(), None
 
                 target_global_idx = int(self.sample_indices[local_idx])
                 target_atac = self.full_atac[target_global_idx]
@@ -494,13 +513,31 @@ class DataProcessor:
                 cand_idx_t = torch.as_tensor(candidates, dtype=torch.long)
                 cand_atac = self.full_atac[cand_idx_t]
                 dists = torch.sum((cand_atac - target_atac.unsqueeze(0)) ** 2, dim=1)
-                k = min(self.control_match_k, dists.shape[0])
-                if self.is_train and k > 1:
-                    topk_ids = torch.topk(dists, k=k, largest=False).indices.cpu().numpy()
-                    picked = int(self.rng.choice(topk_ids))
-                    return int(candidates[picked])
-                best = int(torch.argmin(dists).item())
-                return int(candidates[best])
+                order = torch.argsort(dists, dim=0).cpu().numpy()
+                sorted_candidates = candidates[order].tolist()
+                sorted_dists = dists[order].detach().cpu()
+                return sorted_candidates, sorted_dists
+
+            def _build_control_prototype(self, local_idx, c_id):
+                ranked_candidates, ranked_dists = self._rank_control_candidates(local_idx, c_id)
+                if len(ranked_candidates) == 0:
+                    raise ValueError("未找到可用于构造 control prototype 的候选 control。")
+
+                k = min(self.control_match_k, len(ranked_candidates))
+                if ranked_dists is None and self.is_train and len(ranked_candidates) > k:
+                    picked = self.rng.choice(np.asarray(ranked_candidates), size=k, replace=False).tolist()
+                    picked_dists = None
+                else:
+                    picked = ranked_candidates[:k]
+                    picked_dists = ranked_dists[:k] if ranked_dists is not None else None
+
+                rnas = torch.stack([self._get_rna_from_global(int(gidx)) for gidx in picked], dim=0)
+                if self.control_prototype_mode == 'topk_mean' or picked_dists is None:
+                    return torch.mean(rnas, dim=0)
+
+                # topk_weighted
+                weights = torch.softmax(-picked_dists / self.control_prototype_temp, dim=0).to(rnas.dtype)
+                return torch.sum(weights.unsqueeze(1) * rnas, dim=0)
 
             def _get_rna_from_global(self, global_idx):
                 row = self.full_rna[global_idx]
@@ -540,6 +577,8 @@ class DataProcessor:
             control_match_mode=control_match_mode,
             control_match_k=control_match_k,
             control_match_scope=control_match_scope,
+            control_prototype_mode=control_prototype_mode,
+            control_prototype_temp=control_prototype_temp,
         )
         val_ds = GenerativeDataset(
             full_rna=X,
@@ -558,6 +597,8 @@ class DataProcessor:
             control_match_mode=control_match_mode,
             control_match_k=control_match_k,
             control_match_scope=control_match_scope,
+            control_prototype_mode=control_prototype_mode,
+            control_prototype_temp=control_prototype_temp,
         )
         test_ds = GenerativeDataset(
             full_rna=X,
@@ -576,6 +617,8 @@ class DataProcessor:
             control_match_mode=control_match_mode,
             control_match_k=control_match_k,
             control_match_scope=control_match_scope,
+            control_prototype_mode=control_prototype_mode,
+            control_prototype_temp=control_prototype_temp,
         )
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
