@@ -290,10 +290,8 @@ def evaluate():
             ctrl = batch['rna_control'].to(device)
             target = batch['rna_target'].to(device)
             perturb = batch['perturb'].to(device)
-            perturb_type = batch['perturb_type'].to(device) if 'perturb_type' in batch else None
-            perturb_gene_a = batch['perturb_gene_a'].to(device) if 'perturb_gene_a' in batch else None
-            perturb_gene_b = batch['perturb_gene_b'].to(device) if 'perturb_gene_b' in batch else None
-            has_second_gene = batch['has_second_gene'].to(device) if 'has_second_gene' in batch else None
+            perturb_gene_idx = batch['perturb_gene_idx'].to(device) if 'perturb_gene_idx' in batch else None
+            is_control = batch['is_control'].to(device) if 'is_control' in batch else None
             dose = batch['dose'].to(device) if 'dose' in batch else None
             atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
             drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
@@ -306,10 +304,8 @@ def evaluate():
                 drug_feat=drug_feat,
                 sample_steps=sample_steps,
                 guidance_scale=guidance_scale,
-                perturb_type=perturb_type,
-                perturb_gene_a=perturb_gene_a,
-                perturb_gene_b=perturb_gene_b,
-                has_second_gene=has_second_gene,
+                perturb_gene_idx=perturb_gene_idx,
+                is_control=is_control,
             )
             pred_np = pred.cpu().numpy()
             target_np = target.cpu().numpy()

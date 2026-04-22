@@ -164,10 +164,8 @@ def main():
             rna_control=control,
             perturb=torch.tensor([pid], dtype=torch.long, device=device),
             atac_feat=atac_feat,
-            perturb_type=structured['perturb_type'].to(device),
-            perturb_gene_a=structured['perturb_gene_a'].to(device),
-            perturb_gene_b=structured['perturb_gene_b'].to(device),
-            has_second_gene=structured['has_second_gene'].to(device),
+            perturb_gene_idx=structured['perturb_gene_idx'].to(device),
+            is_control=structured['is_control'].to(device),
         )
         latents.append(latent)
 
@@ -181,10 +179,8 @@ def main():
             atac_feat=atac_feat,
             sample_steps=args.sample_steps,
             guidance_scale=args.guidance_scale,
-            perturb_type=primary_structured['perturb_type'],
-            perturb_gene_a=primary_structured['perturb_gene_a'],
-            perturb_gene_b=primary_structured['perturb_gene_b'],
-            has_second_gene=primary_structured['has_second_gene'],
+            perturb_gene_idx=primary_structured['perturb_gene_idx'],
+            is_control=primary_structured['is_control'],
         )
         latent_used = latents[0]
     else:
@@ -196,10 +192,8 @@ def main():
             atac_feat=atac_feat,
             sample_steps=args.sample_steps,
             guidance_scale=args.guidance_scale,
-            perturb_type=primary_structured['perturb_type'],
-            perturb_gene_a=primary_structured['perturb_gene_a'],
-            perturb_gene_b=primary_structured['perturb_gene_b'],
-            has_second_gene=primary_structured['has_second_gene'],
+            perturb_gene_idx=primary_structured['perturb_gene_idx'],
+            is_control=primary_structured['is_control'],
         )
 
     pred_np = pred.squeeze(0).detach().cpu().numpy()
@@ -247,10 +241,8 @@ def main():
             rna_control=control,
             perturb=torch.tensor([pid_to], dtype=torch.long, device=device),
             atac_feat=atac_feat,
-            perturb_type=interp_structured['perturb_type'],
-            perturb_gene_a=interp_structured['perturb_gene_a'],
-            perturb_gene_b=interp_structured['perturb_gene_b'],
-            has_second_gene=interp_structured['has_second_gene'],
+            perturb_gene_idx=interp_structured['perturb_gene_idx'],
+            is_control=interp_structured['is_control'],
         )
         interp = model.interpolate_latents(latents[0], latent_to, steps=args.interp_steps)
         traj_preds = []
@@ -262,10 +254,8 @@ def main():
                 atac_feat=atac_feat,
                 sample_steps=args.sample_steps,
                 guidance_scale=args.guidance_scale,
-                perturb_type=primary_structured['perturb_type'],
-                perturb_gene_a=primary_structured['perturb_gene_a'],
-                perturb_gene_b=primary_structured['perturb_gene_b'],
-                has_second_gene=primary_structured['has_second_gene'],
+                perturb_gene_idx=primary_structured['perturb_gene_idx'],
+                is_control=primary_structured['is_control'],
             )
             traj_preds.append(p.squeeze(0).detach().cpu().numpy())
         traj_arr = np.stack(traj_preds, axis=0)

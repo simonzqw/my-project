@@ -187,15 +187,7 @@ class PerturbationDiffusionPredictor(nn.Module):
         self.perturb_gene_embedding = None
         if self.n_perturb_genes > 0:
             self.perturb_gene_embedding = nn.Embedding(self.n_perturb_genes, perturb_dim)
-        self.perturb_type_embedding = nn.Embedding(3, perturb_dim)
-        self.pair_interaction = nn.Sequential(
-            nn.Linear(perturb_dim * 4, perturb_dim),
-            nn.LayerNorm(perturb_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(perturb_dim, perturb_dim),
-            nn.LayerNorm(perturb_dim),
-        )
+        self.control_flag_embedding = nn.Embedding(2, perturb_dim)
 
         self.rna_projection = nn.Sequential(
             nn.Linear(n_genes, 512),
@@ -359,41 +351,23 @@ class PerturbationDiffusionPredictor(nn.Module):
     def encode_perturbation(
         self,
         perturb: torch.Tensor,
-        perturb_type: Optional[torch.Tensor] = None,
-        perturb_gene_a: Optional[torch.Tensor] = None,
-        perturb_gene_b: Optional[torch.Tensor] = None,
-        has_second_gene: Optional[torch.Tensor] = None,
+        perturb_gene_idx: Optional[torch.Tensor] = None,
+        is_control: Optional[torch.Tensor] = None,
         dose: Optional[torch.Tensor] = None,
         drug_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size = perturb.shape[0]
-        if (
-            self.perturb_gene_embedding is not None
-            and perturb_gene_a is not None
-            and perturb_gene_b is not None
-            and perturb_type is not None
-        ):
-            a_emb = self.perturb_gene_embedding(perturb_gene_a)
-            b_emb = self.perturb_gene_embedding(perturb_gene_b)
-            type_emb = self.perturb_type_embedding(perturb_type)
-            if has_second_gene is None:
-                has_second_gene = (perturb_type == 2).float()
-            if has_second_gene.dim() == 1:
-                has_second_gene = has_second_gene.unsqueeze(1)
-            has_second_gene = has_second_gene.to(a_emb.dtype)
-
-            b_masked = b_emb * has_second_gene
-            pair_base = 0.5 * (a_emb + b_masked)
-            pair_inter = self.pair_interaction(
-                torch.cat([a_emb, b_emb, a_emb * b_emb, torch.abs(a_emb - b_emb)], dim=1)
-            )
-            ref = pair_base
+        if self.perturb_gene_embedding is not None and perturb_gene_idx is not None:
+            gene_emb = self.perturb_gene_embedding(perturb_gene_idx)
+            if is_control is None:
+                is_control = torch.zeros_like(perturb_gene_idx)
+            ctrl_flag_emb = self.control_flag_embedding(is_control.long())
+            base_feat = gene_emb + ctrl_flag_emb
+            ref = base_feat
         else:
             p_emb = self._perturb_tokens(perturb, dose=dose)
-            pair_base = p_emb.mean(dim=1)
-            pair_inter = torch.zeros_like(pair_base)
-            type_emb = torch.zeros_like(pair_base)
-            ref = pair_base
+            base_feat = p_emb.mean(dim=1)
+            ref = base_feat
 
         dose = self._prepare_dose(batch_size, dose, ref)
         dose_feat = self.dose_projection(dose)
@@ -402,9 +376,8 @@ class PerturbationDiffusionPredictor(nn.Module):
                 drug_feat = drug_feat.unsqueeze(0)
             drug_token = self.drug_projection(drug_feat)
         else:
-            drug_token = torch.zeros_like(pair_base)
-        z_pert = self.perturbation_encoder(torch.cat([pair_base + type_emb, dose_feat, drug_token], dim=1))
-        z_pert = z_pert + 0.5 * pair_inter
+            drug_token = torch.zeros_like(base_feat)
+        z_pert = self.perturbation_encoder(torch.cat([base_feat, dose_feat, drug_token], dim=1))
         return z_pert
 
     def compose_effect(self, z_bg: torch.Tensor, z_pert: torch.Tensor) -> torch.Tensor:
@@ -421,22 +394,18 @@ class PerturbationDiffusionPredictor(nn.Module):
         atac_feat: Optional[torch.Tensor] = None,
         drug_feat: Optional[torch.Tensor] = None,
         custom_latent: Optional[torch.Tensor] = None,
-        perturb_type: Optional[torch.Tensor] = None,
-        perturb_gene_a: Optional[torch.Tensor] = None,
-        perturb_gene_b: Optional[torch.Tensor] = None,
-        has_second_gene: Optional[torch.Tensor] = None,
+        perturb_gene_idx: Optional[torch.Tensor] = None,
+        is_control: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if custom_latent is not None:
             return custom_latent
         z_bg = self.encode_background(rna_control=rna_control, atac_feat=atac_feat)
         z_pert = self.encode_perturbation(
             perturb=perturb,
+            perturb_gene_idx=perturb_gene_idx,
+            is_control=is_control,
             dose=dose,
             drug_feat=drug_feat,
-            perturb_type=perturb_type,
-            perturb_gene_a=perturb_gene_a,
-            perturb_gene_b=perturb_gene_b,
-            has_second_gene=has_second_gene,
         )
         z_eff = self.compose_effect(z_bg=z_bg, z_pert=z_pert)
         return z_eff
@@ -450,10 +419,8 @@ class PerturbationDiffusionPredictor(nn.Module):
         atac_feat: Optional[torch.Tensor] = None,
         drug_feat: Optional[torch.Tensor] = None,
         force_uncond: bool = False,
-        perturb_type: Optional[torch.Tensor] = None,
-        perturb_gene_a: Optional[torch.Tensor] = None,
-        perturb_gene_b: Optional[torch.Tensor] = None,
-        has_second_gene: Optional[torch.Tensor] = None,
+        perturb_gene_idx: Optional[torch.Tensor] = None,
+        is_control: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size = rna_control.shape[0]
         z_bg = self.encode_background(
@@ -467,10 +434,8 @@ class PerturbationDiffusionPredictor(nn.Module):
             atac_feat=atac_feat,
             drug_feat=drug_feat,
             custom_latent=custom_latent,
-            perturb_type=perturb_type,
-            perturb_gene_a=perturb_gene_a,
-            perturb_gene_b=perturb_gene_b,
-            has_second_gene=has_second_gene,
+            perturb_gene_idx=perturb_gene_idx,
+            is_control=is_control,
         )
 
         if force_uncond:
@@ -491,10 +456,8 @@ class PerturbationDiffusionPredictor(nn.Module):
         dose: Optional[torch.Tensor] = None,
         atac_feat: Optional[torch.Tensor] = None,
         drug_feat: Optional[torch.Tensor] = None,
-        perturb_type: Optional[torch.Tensor] = None,
-        perturb_gene_a: Optional[torch.Tensor] = None,
-        perturb_gene_b: Optional[torch.Tensor] = None,
-        has_second_gene: Optional[torch.Tensor] = None,
+        perturb_gene_idx: Optional[torch.Tensor] = None,
+        is_control: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.encode_semantic_latent(
             rna_control=rna_control,
@@ -502,10 +465,8 @@ class PerturbationDiffusionPredictor(nn.Module):
             dose=dose,
             atac_feat=atac_feat,
             drug_feat=drug_feat,
-            perturb_type=perturb_type,
-            perturb_gene_a=perturb_gene_a,
-            perturb_gene_b=perturb_gene_b,
-            has_second_gene=has_second_gene,
+            perturb_gene_idx=perturb_gene_idx,
+            is_control=is_control,
         )
 
     def combine_latents(
@@ -574,10 +535,8 @@ class PerturbationDiffusionPredictor(nn.Module):
         t: Optional[torch.Tensor] = None,
         weights: Optional[torch.Tensor] = None,
         return_details: bool = False,
-        perturb_type: Optional[torch.Tensor] = None,
-        perturb_gene_a: Optional[torch.Tensor] = None,
-        perturb_gene_b: Optional[torch.Tensor] = None,
-        has_second_gene: Optional[torch.Tensor] = None,
+        perturb_gene_idx: Optional[torch.Tensor] = None,
+        is_control: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         context = self.encode_context(
             rna_control=rna_control,
@@ -585,10 +544,8 @@ class PerturbationDiffusionPredictor(nn.Module):
             dose=dose,
             atac_feat=atac_feat,
             drug_feat=drug_feat,
-            perturb_type=perturb_type,
-            perturb_gene_a=perturb_gene_a,
-            perturb_gene_b=perturb_gene_b,
-            has_second_gene=has_second_gene,
+            perturb_gene_idx=perturb_gene_idx,
+            is_control=is_control,
         )
 
         if target_rna is None:
@@ -628,10 +585,8 @@ class PerturbationDiffusionPredictor(nn.Module):
         drug_feat: Optional[torch.Tensor] = None,
         sample_steps: Optional[int] = None,
         guidance_scale: float = 1.0,
-        perturb_type: Optional[torch.Tensor] = None,
-        perturb_gene_a: Optional[torch.Tensor] = None,
-        perturb_gene_b: Optional[torch.Tensor] = None,
-        has_second_gene: Optional[torch.Tensor] = None,
+        perturb_gene_idx: Optional[torch.Tensor] = None,
+        is_control: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.sample(
             rna_control=rna_control,
@@ -641,10 +596,8 @@ class PerturbationDiffusionPredictor(nn.Module):
             drug_feat=drug_feat,
             sample_steps=sample_steps,
             guidance_scale=guidance_scale,
-            perturb_type=perturb_type,
-            perturb_gene_a=perturb_gene_a,
-            perturb_gene_b=perturb_gene_b,
-            has_second_gene=has_second_gene,
+            perturb_gene_idx=perturb_gene_idx,
+            is_control=is_control,
         )
 
     @torch.no_grad()
@@ -658,10 +611,8 @@ class PerturbationDiffusionPredictor(nn.Module):
         drug_feat: Optional[torch.Tensor] = None,
         sample_steps: Optional[int] = None,
         guidance_scale: float = 1.0,
-        perturb_type: Optional[torch.Tensor] = None,
-        perturb_gene_a: Optional[torch.Tensor] = None,
-        perturb_gene_b: Optional[torch.Tensor] = None,
-        has_second_gene: Optional[torch.Tensor] = None,
+        perturb_gene_idx: Optional[torch.Tensor] = None,
+        is_control: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if perturb is None:
             perturb = torch.zeros((rna_control.shape[0],), dtype=torch.long, device=rna_control.device)
@@ -674,10 +625,8 @@ class PerturbationDiffusionPredictor(nn.Module):
             drug_feat=drug_feat,
             sample_steps=sample_steps,
             guidance_scale=guidance_scale,
-            perturb_type=perturb_type,
-            perturb_gene_a=perturb_gene_a,
-            perturb_gene_b=perturb_gene_b,
-            has_second_gene=has_second_gene,
+            perturb_gene_idx=perturb_gene_idx,
+            is_control=is_control,
         )
 
     @torch.no_grad()
@@ -691,10 +640,8 @@ class PerturbationDiffusionPredictor(nn.Module):
         drug_feat: Optional[torch.Tensor] = None,
         sample_steps: Optional[int] = None,
         guidance_scale: float = 1.0,
-        perturb_type: Optional[torch.Tensor] = None,
-        perturb_gene_a: Optional[torch.Tensor] = None,
-        perturb_gene_b: Optional[torch.Tensor] = None,
-        has_second_gene: Optional[torch.Tensor] = None,
+        perturb_gene_idx: Optional[torch.Tensor] = None,
+        is_control: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         context = self.encode_context(
             rna_control=rna_control,
@@ -703,10 +650,8 @@ class PerturbationDiffusionPredictor(nn.Module):
             custom_latent=custom_latent,
             atac_feat=atac_feat,
             drug_feat=drug_feat,
-            perturb_type=perturb_type,
-            perturb_gene_a=perturb_gene_a,
-            perturb_gene_b=perturb_gene_b,
-            has_second_gene=has_second_gene,
+            perturb_gene_idx=perturb_gene_idx,
+            is_control=is_control,
         )
 
         uncond_context = None
@@ -719,10 +664,8 @@ class PerturbationDiffusionPredictor(nn.Module):
                 atac_feat=atac_feat,
                 drug_feat=drug_feat,
                 force_uncond=True,
-                perturb_type=perturb_type,
-                perturb_gene_a=perturb_gene_a,
-                perturb_gene_b=perturb_gene_b,
-                has_second_gene=has_second_gene,
+                perturb_gene_idx=perturb_gene_idx,
+                is_control=is_control,
             )
 
         generated_rna = self.diffusion.sample(
