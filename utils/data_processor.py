@@ -112,6 +112,15 @@ class DataProcessor:
         self.perturb_map = {name: i for i, name in enumerate(self.perturb_categories)}
         self.id_to_perturb = {i: name for name, i in self.perturb_map.items()}
         self._build_perturb_gene_vocab()
+        parsed_structs = [
+            self._parse_structured_perturbation(str(x))
+            for x in self.adata.obs['perturbation'].astype(str).values
+        ]
+        self.adata.obs['perturb_type'] = np.array([d['perturb_type'] for d in parsed_structs], dtype=np.int64)
+        self.adata.obs['perturb_gene_a'] = np.array([d['gene_a'] for d in parsed_structs], dtype=np.int64)
+        self.adata.obs['perturb_gene_b'] = np.array([d['gene_b'] for d in parsed_structs], dtype=np.int64)
+        self.adata.obs['has_second_gene'] = np.array([d['has_second_gene'] for d in parsed_structs], dtype=np.int64)
+        print(">>> structured perturbation fields 已写入 adata.obs: perturb_type / perturb_gene_a / perturb_gene_b / has_second_gene")
 
         cell_line_col = 'cell_line' if 'cell_line' in self.adata.obs else 'source_batch'
         self.cell_line_col = cell_line_col
