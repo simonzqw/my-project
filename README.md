@@ -161,6 +161,8 @@ python visualize.py \
 - 条件融合增强：支持 `dose + ATAC + drug embedding` 作为上下文条件；
 - 训练策略增强：支持 `uniform / loss-second-moment` 时间步采样；
 - 采样策略增强：支持 DDIM 快速采样（`--sample_steps`）与 classifier-free guidance（`--guidance_scale` + `--cond_dropout`）；
+- 组合扰动增强：`predict_diffusion.py` / `visualize_diffusion.py` 支持 `--latent_mode adaptive`，在加权叠加基础上引入 pairwise 非线性交互与门控融合；
+- 轨迹能力增强：`predict_diffusion.py` 支持 `--interpolate_to` 与 `--interp_steps` 生成 latent interpolation 轨迹；
 - 工程能力增强：支持 AMP、EMA、`latest.pth` 断点续训、按 epoch 轮转保存。
 
 示例：
@@ -208,3 +210,17 @@ python build_atac_bank.py \
 输出：
 - `atac_bank_out/atac_bank.npz`
 - `atac_bank_out/atac_bank_meta.json`
+
+---
+
+## 9. Cross-species Context（实验脚本）
+
+新增 3 个实验脚本（`scripts/`）用于“去 cell_line 离散依赖、改用 control RNA + ATAC context”路线：
+
+- `prepare_mouse_context.py`：把 mouse scRNA + ATAC peaks 处理为
+  - `mouse_control_expr.npy`
+  - `mouse_atac_token.npy`
+  - `shared_gene_order.txt`
+  - `mouse_context_meta.json`
+- `train_cross_species_ctx.py`：训练不依赖 `cell_line` 的 `PerturbationPredictorNoCellLine`（位于 `models/reasoning_mlp.py`）。
+- `cross_species_infer_ctx.py`：用 `mouse_control_expr.npy + mouse_atac_token.npy + human checkpoint` 做跨物种条件推理。
