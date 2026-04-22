@@ -415,6 +415,10 @@ class DataProcessor:
         train_control_pool_coarse, train_control_pool_fine = build_control_pools(train_ctrl_idx)
         val_control_pool_coarse, val_control_pool_fine = build_control_pools(val_ctrl_idx)
         test_control_pool_coarse, test_control_pool_fine = build_control_pools(test_ctrl_idx)
+        # 对于 perturbation zero-shot，val/test 通常没有 control。
+        # 因此统一复用 train control 作为 reference control bank。
+        ref_control_pool_coarse = train_control_pool_coarse
+        ref_control_pool_fine = train_control_pool_fine if batch_ids is not None else None
 
         if len(all_ctrl_idx) == 0:
             raise ValueError("未找到 control 样本，无法构建 control pool。")
@@ -654,8 +658,8 @@ class DataProcessor:
             doses=val_doses,
             atac_feats=val_atac,
             control_id=control_id,
-            control_pool_coarse=val_control_pool_coarse,
-            control_pool_fine=val_control_pool_fine if batch_ids is not None else None,
+            control_pool_coarse=ref_control_pool_coarse,
+            control_pool_fine=ref_control_pool_fine,
             local_batch_ids=val_local_batch,
             is_train=False,
             seed=42,
@@ -676,8 +680,8 @@ class DataProcessor:
             doses=test_doses,
             atac_feats=test_atac,
             control_id=control_id,
-            control_pool_coarse=test_control_pool_coarse,
-            control_pool_fine=test_control_pool_fine if batch_ids is not None else None,
+            control_pool_coarse=ref_control_pool_coarse,
+            control_pool_fine=ref_control_pool_fine,
             local_batch_ids=test_local_batch,
             is_train=False,
             seed=42,
