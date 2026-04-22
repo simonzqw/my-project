@@ -166,6 +166,7 @@ def get_args():
     parser.add_argument('--split_strategy', type=str, default='perturbation', choices=['random', 'perturbation', 'custom'])
     parser.add_argument('--split_col', type=str, default='split')
     parser.add_argument('--perturb_parse_mode', type=str, default='raw', choices=['raw', 'single_gene_suffix_clean', 'double_gene_parse'])
+    parser.add_argument('--task_mode', type=str, default=None, choices=['single_gene', 'translation'])
     parser.add_argument('--test_size', type=float, default=0.1)
     parser.add_argument('--val_size', type=float, default=0.1)
     parser.add_argument('--sample_steps', type=int, default=None)
@@ -221,6 +222,8 @@ def load_model_from_checkpoint(checkpoint, n_genes, n_perts, processor, device, 
         atac_dim=atac_dim,
         cond_dropout=getattr(ckpt_args, 'cond_dropout', 0.0),
         n_perturb_genes=len(getattr(processor, 'perturb_gene_vocab', []) or []),
+        task_mode=(getattr(get_args_cache, 'task_mode', None) if getattr(get_args_cache, 'task_mode', None) is not None else getattr(ckpt_args, 'task_mode', 'single_gene')),
+        n_conditions=getattr(processor, 'n_conditions', 0),
     ).to(device)
 
     missing, unexpected = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
@@ -259,6 +262,7 @@ def evaluate():
         split_strategy=args.split_strategy,
         split_col=args.split_col,
         perturb_parse_mode=args.perturb_parse_mode,
+        task_mode=(args.task_mode if args.task_mode is not None else getattr(ckpt_args, 'task_mode', 'single_gene')),
         atac_key=args.atac_key if args.atac_key is not None else getattr(ckpt_args, 'atac_key', None),
         atac_bank_path=args.atac_bank_path if args.atac_bank_path is not None else getattr(ckpt_args, 'atac_bank_path', None),
         background_key=args.background_key if args.background_key is not None else getattr(ckpt_args, 'background_key', 'cell_context'),
@@ -292,6 +296,8 @@ def evaluate():
             perturb = batch['perturb'].to(device)
             perturb_gene_idx = batch['perturb_gene_idx'].to(device) if 'perturb_gene_idx' in batch else None
             is_control = batch['is_control'].to(device) if 'is_control' in batch else None
+            condition_id = batch['condition_id'].to(device) if 'condition_id' in batch else None
+            source_flag = batch['source_flag'].to(device) if 'source_flag' in batch else None
             dose = batch['dose'].to(device) if 'dose' in batch else None
             atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
             drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
@@ -306,6 +312,8 @@ def evaluate():
                 guidance_scale=guidance_scale,
                 perturb_gene_idx=perturb_gene_idx,
                 is_control=is_control,
+                condition_id=condition_id,
+                source_flag=source_flag,
             )
             pred_np = pred.cpu().numpy()
             target_np = target.cpu().numpy()

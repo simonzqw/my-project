@@ -22,6 +22,7 @@ class DataProcessor:
         split_strategy='random',
         split_col: str = 'split',
         perturb_parse_mode: str = 'raw',
+        task_mode: str = 'single_gene',
         atac_key: Optional[str] = None,
         atac_bank_path: Optional[str] = None,
         background_key: str = 'cell_context',
@@ -32,6 +33,9 @@ class DataProcessor:
         self.split_strategy = split_strategy
         self.split_col = split_col
         self.perturb_parse_mode = perturb_parse_mode
+        if task_mode not in {'single_gene', 'translation'}:
+            raise ValueError("task_mode must be 'single_gene' or 'translation'")
+        self.task_mode = task_mode
         self.atac_key = atac_key
         self.atac_bank_path = atac_bank_path
         self.background_key = background_key
@@ -45,6 +49,9 @@ class DataProcessor:
         self.pad_gene_token = "__PAD__"
         self.cell_line_map = None
         self.gene_to_idx = None
+        self.condition_map = None
+        self.condition_categories = None
+        self.n_conditions = 0
 
         self.atac_features = None
         self.atac_dim = 0
@@ -133,6 +140,25 @@ class DataProcessor:
         self.adata.obs['perturb_gene_idx'] = np.array(perturb_gene_idx, dtype=np.int64)
         self.adata.obs['is_control'] = np.array(is_control, dtype=np.int64)
         print(">>> 已写入 adata.obs: perturb_gene_idx / is_control")
+
+        if self.task_mode == 'translation':
+            cond_col = 'condition' if 'condition' in self.adata.obs else 'perturbation'
+            self.adata.obs[cond_col] = self.adata.obs[cond_col].astype('category')
+            self.condition_categories = self.adata.obs[cond_col].cat.categories.tolist()
+            self.condition_map = {name: i for i, name in enumerate(self.condition_categories)}
+            self.n_conditions = len(self.condition_categories)
+            self.adata.obs['condition_id'] = self.adata.obs[cond_col].cat.codes.astype(np.int64)
+            if 'orig_condition' in self.adata.obs:
+                self.adata.obs['source_flag'] = (
+                    self.adata.obs[cond_col].astype(str).values == self.adata.obs['orig_condition'].astype(str).values
+                ).astype(np.int64)
+            else:
+                self.adata.obs['source_flag'] = np.zeros(self.adata.n_obs, dtype=np.int64)
+            print(f">>> translation mode condition vocab size: {self.n_conditions} (col={cond_col})")
+        else:
+            self.adata.obs['condition_id'] = np.zeros(self.adata.n_obs, dtype=np.int64)
+            self.adata.obs['source_flag'] = np.zeros(self.adata.n_obs, dtype=np.int64)
+            self.n_conditions = 0
 
         cell_line_col = 'cell_line' if 'cell_line' in self.adata.obs else 'source_batch'
         self.cell_line_col = cell_line_col
@@ -346,6 +372,8 @@ class DataProcessor:
         perturb_ids = self.adata.obs['perturbation'].cat.codes.values
         perturb_gene_idx_ids = self.adata.obs['perturb_gene_idx'].values.astype(np.int64)
         is_control_ids = self.adata.obs['is_control'].values.astype(np.float32)
+        condition_id_ids = self.adata.obs['condition_id'].values.astype(np.int64)
+        source_flag_ids = self.adata.obs['source_flag'].values.astype(np.int64)
         cell_line_ids = self.adata.obs[self.cell_line_col].cat.codes.values
         control_id = self.perturb_map.get('control', None)
 
@@ -433,6 +461,8 @@ class DataProcessor:
                 c_ids,
                 p_gene_idx,
                 p_is_control,
+                p_condition_id,
+                p_source_flag,
                 doses,
                 atac_feats,
                 control_id,
@@ -459,6 +489,8 @@ class DataProcessor:
                 self.c_ids = c_ids
                 self.p_gene_idx = p_gene_idx
                 self.p_is_control = p_is_control
+                self.p_condition_id = p_condition_id
+                self.p_source_flag = p_source_flag
                 self.doses = doses
                 self.atac_feats = atac_feats
                 self.control_id = control_id
@@ -502,6 +534,8 @@ class DataProcessor:
                 p_id = int(self.p_ids[idx])
                 perturb_gene_idx = int(self.p_gene_idx[idx])
                 is_control = float(self.p_is_control[idx])
+                condition_id = int(self.p_condition_id[idx])
+                source_flag = int(self.p_source_flag[idx])
 
                 dose_val = self.doses[idx] if self.doses is not None else torch.tensor(0.0)
                 atac_val = self.atac_feats[idx] if self.atac_feats is not None else None
@@ -533,6 +567,8 @@ class DataProcessor:
                     'perturb': torch.tensor(p_id, dtype=torch.long),
                     'perturb_gene_idx': torch.tensor(perturb_gene_idx, dtype=torch.long),
                     'is_control': torch.tensor(is_control, dtype=torch.float32),
+                    'condition_id': torch.tensor(condition_id, dtype=torch.long),
+                    'source_flag': torch.tensor(source_flag, dtype=torch.long),
                     'cell_line': torch.tensor(c_id, dtype=torch.long),
                     'dose': dose_val,
                 }
@@ -630,6 +666,8 @@ class DataProcessor:
             c_ids=cell_line_ids[train_idx],
             p_gene_idx=perturb_gene_idx_ids[train_idx],
             p_is_control=is_control_ids[train_idx],
+            p_condition_id=condition_id_ids[train_idx],
+            p_source_flag=source_flag_ids[train_idx],
             doses=train_doses,
             atac_feats=train_atac,
             control_id=control_id,
@@ -655,6 +693,8 @@ class DataProcessor:
             c_ids=cell_line_ids[val_idx],
             p_gene_idx=perturb_gene_idx_ids[val_idx],
             p_is_control=is_control_ids[val_idx],
+            p_condition_id=condition_id_ids[val_idx],
+            p_source_flag=source_flag_ids[val_idx],
             doses=val_doses,
             atac_feats=val_atac,
             control_id=control_id,
@@ -677,6 +717,8 @@ class DataProcessor:
             c_ids=cell_line_ids[test_idx],
             p_gene_idx=perturb_gene_idx_ids[test_idx],
             p_is_control=is_control_ids[test_idx],
+            p_condition_id=condition_id_ids[test_idx],
+            p_source_flag=source_flag_ids[test_idx],
             doses=test_doses,
             atac_feats=test_atac,
             control_id=control_id,

@@ -121,6 +121,7 @@ def get_args():
     parser.add_argument('--split_strategy', type=str, default='perturbation', choices=['random', 'perturbation', 'custom'])
     parser.add_argument('--split_col', type=str, default='split')
     parser.add_argument('--perturb_parse_mode', type=str, default='raw', choices=['raw', 'single_gene_suffix_clean', 'double_gene_parse'])
+    parser.add_argument('--task_mode', type=str, default='single_gene', choices=['single_gene', 'translation'])
     parser.add_argument('--test_size', type=float, default=0.1)
     parser.add_argument('--val_size', type=float, default=0.1)
 
@@ -300,6 +301,7 @@ def train():
         split_strategy=args.split_strategy,
         split_col=args.split_col,
         perturb_parse_mode=args.perturb_parse_mode,
+        task_mode=args.task_mode,
         atac_key=args.atac_key,
         atac_bank_path=args.atac_bank_path,
         background_key=args.background_key,
@@ -341,6 +343,8 @@ def train():
         atac_dim=atac_dim,
         cond_dropout=args.cond_dropout,
         n_perturb_genes=len(getattr(processor, 'perturb_gene_vocab', []) or []),
+        task_mode=args.task_mode,
+        n_conditions=getattr(processor, 'n_conditions', 0),
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -392,6 +396,8 @@ def train():
             perturb = batch['perturb'].to(device)
             perturb_gene_idx = batch['perturb_gene_idx'].to(device) if 'perturb_gene_idx' in batch else None
             is_control = batch['is_control'].to(device) if 'is_control' in batch else None
+            condition_id = batch['condition_id'].to(device) if 'condition_id' in batch else None
+            source_flag = batch['source_flag'].to(device) if 'source_flag' in batch else None
             dose = batch['dose'].to(device) if 'dose' in batch else None
             atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
             drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
@@ -412,6 +418,8 @@ def train():
                         return_details=True,
                         perturb_gene_idx=perturb_gene_idx,
                         is_control=is_control,
+                        condition_id=condition_id,
+                        source_flag=source_flag,
                     )
                     pred_target = details['pred_target']
                     true_target = details['target_target']
@@ -459,6 +467,8 @@ def train():
                         weights=weights,
                         perturb_gene_idx=perturb_gene_idx,
                         is_control=is_control,
+                        condition_id=condition_id,
+                        source_flag=source_flag,
                     )
 
             scaler.scale(loss / args.accum_steps).backward()
@@ -495,6 +505,8 @@ def train():
                 perturb = batch['perturb'].to(device)
                 perturb_gene_idx = batch['perturb_gene_idx'].to(device) if 'perturb_gene_idx' in batch else None
                 is_control = batch['is_control'].to(device) if 'is_control' in batch else None
+                condition_id = batch['condition_id'].to(device) if 'condition_id' in batch else None
+                source_flag = batch['source_flag'].to(device) if 'source_flag' in batch else None
                 dose = batch['dose'].to(device) if 'dose' in batch else None
                 atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
                 drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
@@ -510,6 +522,8 @@ def train():
                     weights=weights,
                     perturb_gene_idx=perturb_gene_idx,
                     is_control=is_control,
+                    condition_id=condition_id,
+                    source_flag=source_flag,
                 )
                 val_loss += float(loss.item())
 
@@ -524,6 +538,8 @@ def train():
                 perturb = batch['perturb'].to(device)
                 perturb_gene_idx = batch['perturb_gene_idx'].to(device) if 'perturb_gene_idx' in batch else None
                 is_control = batch['is_control'].to(device) if 'is_control' in batch else None
+                condition_id = batch['condition_id'].to(device) if 'condition_id' in batch else None
+                source_flag = batch['source_flag'].to(device) if 'source_flag' in batch else None
                 dose = batch['dose'].to(device) if 'dose' in batch else None
                 atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
                 drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
@@ -538,6 +554,8 @@ def train():
                     guidance_scale=args.guidance_scale,
                     perturb_gene_idx=perturb_gene_idx,
                     is_control=is_control,
+                    condition_id=condition_id,
+                    source_flag=source_flag,
                 )
                 val_metrics.append(calculate_metrics(pred, target, ctrl))
         ema.restore(model)
