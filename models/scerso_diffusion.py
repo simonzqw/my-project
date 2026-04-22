@@ -467,9 +467,11 @@ class PerturbationDiffusionPredictor(nn.Module):
 
         if force_uncond:
             z_sem = torch.zeros_like(z_sem)
+            z_bg = torch.zeros_like(z_bg)
         elif self.training and self.cond_dropout > 0:
             keep = (torch.rand(batch_size, 1, device=rna_control.device) > self.cond_dropout).to(rna_control.dtype)
             z_sem = z_sem * keep
+            z_bg = z_bg * keep
 
         context = torch.cat([z_bg, z_sem], dim=1)
         return context
