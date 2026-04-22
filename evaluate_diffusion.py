@@ -220,7 +220,7 @@ def load_model_from_checkpoint(checkpoint, n_genes, n_perts, processor, device, 
         use_atac=(processor.atac_features is not None),
         atac_dim=atac_dim,
         cond_dropout=getattr(ckpt_args, 'cond_dropout', 0.0),
-        perturb_gene_vocab_size=len(getattr(processor, 'perturb_gene_vocab', []) or []),
+        n_perturb_genes=len(getattr(processor, 'perturb_gene_vocab', []) or []),
     ).to(device)
 
     missing, unexpected = model.load_state_dict(checkpoint['model_state_dict'], strict=False)

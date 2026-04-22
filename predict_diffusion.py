@@ -127,7 +127,7 @@ def main():
         use_atac=(processor.atac_features is not None),
         atac_dim=config['atac_dim'],
         cond_dropout=config['cond_dropout'],
-        perturb_gene_vocab_size=len(getattr(processor, 'perturb_gene_vocab', []) or []),
+        n_perturb_genes=len(getattr(processor, 'perturb_gene_vocab', []) or []),
     ).to(device)
     missing, unexpected = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     if len(missing) > 0:

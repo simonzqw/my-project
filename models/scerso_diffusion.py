@@ -161,7 +161,7 @@ class PerturbationDiffusionPredictor(nn.Module):
         atac_dim: int = 0,
         cond_dropout: float = 0.0,
         target_mode: str = "target",
-        perturb_gene_vocab_size: int = 0,
+        n_perturb_genes: int = 0,
     ):
         super().__init__()
 
@@ -172,7 +172,7 @@ class PerturbationDiffusionPredictor(nn.Module):
         self.use_atac = use_atac and (atac_dim > 0)
         self.atac_dim = atac_dim
         self.cond_dropout = cond_dropout
-        self.perturb_gene_vocab_size = int(perturb_gene_vocab_size) if perturb_gene_vocab_size is not None else 0
+        self.n_perturb_genes = int(n_perturb_genes) if n_perturb_genes is not None else 0
         if target_mode not in {"target", "delta"}:
             raise ValueError("target_mode 必须是 'target' 或 'delta'")
         self.target_mode = target_mode
@@ -185,19 +185,11 @@ class PerturbationDiffusionPredictor(nn.Module):
             self.perturb_embedding = nn.Embedding(n_perturbations, perturb_dim)
 
         self.perturb_gene_embedding = None
-        if self.perturb_gene_vocab_size > 0:
-            self.perturb_gene_embedding = nn.Embedding(self.perturb_gene_vocab_size, perturb_dim)
+        if self.n_perturb_genes > 0:
+            self.perturb_gene_embedding = nn.Embedding(self.n_perturb_genes, perturb_dim)
         self.perturb_type_embedding = nn.Embedding(3, perturb_dim)
-        self.perturb_pair_interaction = nn.Sequential(
+        self.pair_interaction = nn.Sequential(
             nn.Linear(perturb_dim * 4, perturb_dim),
-            nn.LayerNorm(perturb_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(perturb_dim, perturb_dim),
-            nn.LayerNorm(perturb_dim),
-        )
-        self.perturb_pair_fusion = nn.Sequential(
-            nn.Linear(perturb_dim * 3, perturb_dim),
             nn.LayerNorm(perturb_dim),
             nn.SiLU(),
             nn.Dropout(dropout),
@@ -367,47 +359,42 @@ class PerturbationDiffusionPredictor(nn.Module):
     def encode_perturbation(
         self,
         perturb: torch.Tensor,
-        dose: Optional[torch.Tensor] = None,
-        drug_feat: Optional[torch.Tensor] = None,
         perturb_type: Optional[torch.Tensor] = None,
         perturb_gene_a: Optional[torch.Tensor] = None,
         perturb_gene_b: Optional[torch.Tensor] = None,
         has_second_gene: Optional[torch.Tensor] = None,
+        dose: Optional[torch.Tensor] = None,
+        drug_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size = perturb.shape[0]
         if (
             self.perturb_gene_embedding is not None
-            and perturb_type is not None
             and perturb_gene_a is not None
             and perturb_gene_b is not None
+            and perturb_type is not None
         ):
-            gene_a_emb = self.perturb_gene_embedding(perturb_gene_a)
-            gene_b_emb = self.perturb_gene_embedding(perturb_gene_b)
-            if has_second_gene is None:
-                has_second_gene = (perturb_type == 2).to(gene_a_emb.dtype)
-            else:
-                has_second_gene = has_second_gene.to(gene_a_emb.dtype)
-            has_second_gene = has_second_gene.view(-1, 1)
-            gene_b_masked = gene_b_emb * has_second_gene
-            pair_base = (gene_a_emb + gene_b_masked) / (1.0 + has_second_gene)
-            pair_interaction = self.perturb_pair_interaction(
-                torch.cat(
-                    [
-                        gene_a_emb,
-                        gene_b_masked,
-                        gene_a_emb * gene_b_masked,
-                        torch.abs(gene_a_emb - gene_b_masked),
-                    ],
-                    dim=1,
-                )
-            )
+            a_emb = self.perturb_gene_embedding(perturb_gene_a)
+            b_emb = self.perturb_gene_embedding(perturb_gene_b)
             type_emb = self.perturb_type_embedding(perturb_type)
-            p_pooled = self.perturb_pair_fusion(torch.cat([pair_base, pair_interaction, type_emb], dim=1))
+            if has_second_gene is None:
+                has_second_gene = (perturb_type == 2).float()
+            if has_second_gene.dim() == 1:
+                has_second_gene = has_second_gene.unsqueeze(1)
+            has_second_gene = has_second_gene.to(a_emb.dtype)
+
+            b_masked = b_emb * has_second_gene
+            pair_base = 0.5 * (a_emb + b_masked)
+            pair_inter = self.pair_interaction(
+                torch.cat([a_emb, b_emb, a_emb * b_emb, torch.abs(a_emb - b_emb)], dim=1)
+            )
+            ref = pair_base
         else:
             p_emb = self._perturb_tokens(perturb, dose=dose)
-            p_pooled = p_emb.mean(dim=1)
+            pair_base = p_emb.mean(dim=1)
+            pair_inter = torch.zeros_like(pair_base)
+            type_emb = torch.zeros_like(pair_base)
+            ref = pair_base
 
-        ref = p_pooled
         dose = self._prepare_dose(batch_size, dose, ref)
         dose_feat = self.dose_projection(dose)
         if self.drug_projection is not None and drug_feat is not None:
@@ -415,8 +402,9 @@ class PerturbationDiffusionPredictor(nn.Module):
                 drug_feat = drug_feat.unsqueeze(0)
             drug_token = self.drug_projection(drug_feat)
         else:
-            drug_token = torch.zeros_like(p_pooled)
-        z_pert = self.perturbation_encoder(torch.cat([p_pooled, dose_feat, drug_token], dim=1))
+            drug_token = torch.zeros_like(pair_base)
+        z_pert = self.perturbation_encoder(torch.cat([pair_base + type_emb, dose_feat, drug_token], dim=1))
+        z_pert = z_pert + 0.5 * pair_inter
         return z_pert
 
     def compose_effect(self, z_bg: torch.Tensor, z_pert: torch.Tensor) -> torch.Tensor:

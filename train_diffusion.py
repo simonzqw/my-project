@@ -340,7 +340,7 @@ def train():
         use_atac=(processor.atac_features is not None),
         atac_dim=atac_dim,
         cond_dropout=args.cond_dropout,
-        perturb_gene_vocab_size=len(getattr(processor, 'perturb_gene_vocab', []) or []),
+        n_perturb_genes=len(getattr(processor, 'perturb_gene_vocab', []) or []),
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
