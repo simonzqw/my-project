@@ -382,6 +382,10 @@ class DataProcessor:
 
         X = self.adata.X
         perturb_ids = self.adata.obs['perturbation'].cat.codes.values
+        perturb_type_ids = self.adata.obs['perturb_type'].values.astype(np.int64)
+        perturb_gene_a_ids = self.adata.obs['perturb_gene_a'].values.astype(np.int64)
+        perturb_gene_b_ids = self.adata.obs['perturb_gene_b'].values.astype(np.int64)
+        perturb_has_second = self.adata.obs['has_second_gene'].values.astype(np.int64)
         cell_line_ids = self.adata.obs[self.cell_line_col].cat.codes.values
         control_id = self.perturb_map.get('control', None)
 
@@ -463,6 +467,10 @@ class DataProcessor:
                 sample_indices,
                 p_ids,
                 c_ids,
+                p_type_ids,
+                p_gene_a_ids,
+                p_gene_b_ids,
+                p_has_second,
                 doses,
                 atac_feats,
                 control_id,
@@ -487,6 +495,10 @@ class DataProcessor:
                 self.sample_indices = sample_indices
                 self.p_ids = p_ids
                 self.c_ids = c_ids
+                self.p_type_ids = p_type_ids
+                self.p_gene_a_ids = p_gene_a_ids
+                self.p_gene_b_ids = p_gene_b_ids
+                self.p_has_second = p_has_second
                 self.doses = doses
                 self.atac_feats = atac_feats
                 self.control_id = control_id
@@ -663,6 +675,10 @@ class DataProcessor:
             sample_indices=train_idx,
             p_ids=perturb_ids[train_idx],
             c_ids=cell_line_ids[train_idx],
+            p_type_ids=perturb_type_ids[train_idx],
+            p_gene_a_ids=perturb_gene_a_ids[train_idx],
+            p_gene_b_ids=perturb_gene_b_ids[train_idx],
+            p_has_second=perturb_has_second[train_idx],
             doses=train_doses,
             atac_feats=train_atac,
             control_id=control_id,
@@ -688,6 +704,10 @@ class DataProcessor:
             sample_indices=val_idx,
             p_ids=perturb_ids[val_idx],
             c_ids=cell_line_ids[val_idx],
+            p_type_ids=perturb_type_ids[val_idx],
+            p_gene_a_ids=perturb_gene_a_ids[val_idx],
+            p_gene_b_ids=perturb_gene_b_ids[val_idx],
+            p_has_second=perturb_has_second[val_idx],
             doses=val_doses,
             atac_feats=val_atac,
             control_id=control_id,
@@ -710,6 +730,10 @@ class DataProcessor:
             sample_indices=test_idx,
             p_ids=perturb_ids[test_idx],
             c_ids=cell_line_ids[test_idx],
+            p_type_ids=perturb_type_ids[test_idx],
+            p_gene_a_ids=perturb_gene_a_ids[test_idx],
+            p_gene_b_ids=perturb_gene_b_ids[test_idx],
+            p_has_second=perturb_has_second[test_idx],
             doses=test_doses,
             atac_feats=test_atac,
             control_id=control_id,
