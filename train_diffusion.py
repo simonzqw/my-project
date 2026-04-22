@@ -3,6 +3,7 @@ import argparse
 import glob
 import os
 import re
+import sys
 
 import numpy as np
 import torch
@@ -235,7 +236,18 @@ def apply_preset(args):
         },
     }[args.preset]
 
+    cli_tokens = set(sys.argv[1:])
+
+    def _is_explicitly_set(arg_name: str) -> bool:
+        flag = f'--{arg_name}'
+        if flag in cli_tokens:
+            return True
+        prefix = f'{flag}='
+        return any(tok.startswith(prefix) for tok in cli_tokens)
+
     for k, v in preset_updates.items():
+        if _is_explicitly_set(k):
+            continue
         if hasattr(args, k) and getattr(args, k) == base_defaults.get(k, None):
             setattr(args, k, v)
 
