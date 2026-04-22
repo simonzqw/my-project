@@ -3,6 +3,7 @@ import argparse
 import glob
 import os
 import re
+import sys
 
 import numpy as np
 import torch
@@ -15,6 +16,34 @@ from models.scerso_diffusion import PerturbationDiffusionPredictor
 from utils.data_processor import DataProcessor
 from utils.diffusion_schedule import LossSecondMomentResampler, UniformTimestepSampler
 from utils.emb_loader import GeneEmbeddingLoader
+
+
+def _hr(char: str = "─", width: int = 72) -> str:
+    return char * width
+
+
+def print_run_header(args, device):
+    print(f"\n┌{_hr('─', 70)}┐")
+    print(f"│ {'scERso Diffusion Training':^68} │")
+    print(f"├{_hr('─', 70)}┤")
+    print(f"│ device: {str(device):<60} │")
+    print(f"│ data:   {args.data_path[:60]:<60} │")
+    print(f"│ split:  {args.split_strategy:<60} │")
+    print(f"│ steps:  t={args.timesteps}, sample={args.sample_steps}, mode={args.target_mode:<6}, sampler={args.timestep_sampler:<15} │")
+    print(f"│ cfg:    scale={args.guidance_scale:.2f}, cond_dropout={args.cond_dropout:.2f}, amp={str(args.amp):<15} │")
+    print(f"│ early:  metric={args.early_stop_metric:<16} (w_d={args.score_w_delta:.2f}, w_p={args.score_w_top20p:.2f}, w_m={args.score_w_top20mse:.2f}) │")
+    print(f"└{_hr('─', 70)}┘")
+
+
+def print_epoch_summary(epoch, total_epochs, train_loss, val_loss, metrics):
+    top20_p = metrics.get('top20_pearson', 0.0)
+    delta_p = metrics.get('delta_pearson', 0.0)
+    top20_m = metrics.get('top20_mse', 0.0)
+    print(
+        f"[E{epoch:03d}/{total_epochs:03d}] "
+        f"train={train_loss:.4f}  val={val_loss:.4f}  "
+        f"top20_p={top20_p:.4f}  delta_p={delta_p:.4f}  top20_mse={top20_m:.4f}"
+    )
 
 
 class EarlyStopping:
@@ -88,8 +117,12 @@ def get_args():
     parser.add_argument('--data_path', type=str, required=True)
     parser.add_argument('--save_dir', type=str, default='./checkpoints_diff')
     parser.add_argument('--pretrained_emb', type=str, default=None)
+    parser.add_argument('--preset', type=str, default='none', choices=['none', 'vnext', 'smoke'])
 
-    parser.add_argument('--split_strategy', type=str, default='perturbation', choices=['random', 'perturbation'])
+    parser.add_argument('--split_strategy', type=str, default='perturbation', choices=['random', 'perturbation', 'custom'])
+    parser.add_argument('--split_col', type=str, default='split')
+    parser.add_argument('--perturb_parse_mode', type=str, default='raw', choices=['raw', 'single_gene_suffix_clean', 'double_gene_parse'])
+    parser.add_argument('--task_mode', type=str, default='single_gene', choices=['single_gene', 'translation'])
     parser.add_argument('--test_size', type=float, default=0.1)
     parser.add_argument('--val_size', type=float, default=0.1)
 
@@ -101,8 +134,8 @@ def get_args():
     parser.add_argument('--accum_steps', type=int, default=1)
 
     parser.add_argument('--timesteps', type=int, default=1000)
+    parser.add_argument('--target_mode', type=str, default='delta', choices=['target', 'delta'])
     parser.add_argument('--perturb_dim', type=int, default=200)
-    parser.add_argument('--cell_line_dim', type=int, default=32)
     parser.add_argument('--hidden_dims', type=int, nargs='+', default=[512, 512, 512])
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--dose_dim', type=int, default=32)
@@ -117,12 +150,108 @@ def get_args():
     parser.add_argument('--resume_path', type=str, default=None)
     parser.add_argument('--save_every_epoch', action='store_true')
     parser.add_argument('--keep_last_n', type=int, default=3)
+    parser.add_argument('--early_stop_metric', type=str, default='composite', choices=['composite', 'delta_pearson', 'top20_pearson'])
+    parser.add_argument('--score_w_delta', type=float, default=1.0)
+    parser.add_argument('--score_w_top20p', type=float, default=0.2)
+    parser.add_argument('--score_w_top20mse', type=float, default=0.02)
+    parser.add_argument('--lambda_topde', type=float, default=0.0)
+    parser.add_argument('--lambda_delta_corr', type=float, default=0.0)
+    parser.add_argument('--lambda_centroid', type=float, default=0.0)
+    parser.add_argument('--topde_k', type=int, default=50)
 
     parser.add_argument('--atac_key', type=str, default=None)
     parser.add_argument('--atac_bank_path', type=str, default=None)
     parser.add_argument('--background_key', type=str, default='cell_context')
+    parser.add_argument('--control_match_mode', type=str, default='random', choices=['random', 'atac_knn'])
+    parser.add_argument('--control_match_k', type=int, default=32)
+    parser.add_argument('--control_match_scope', type=str, default='global', choices=['global', 'cell_line'])
+    parser.add_argument('--control_prototype_mode', type=str, default='topk_weighted', choices=['single', 'topk_mean', 'topk_weighted'])
+    parser.add_argument('--control_prototype_temp', type=float, default=1.0)
 
     return parser.parse_args()
+
+
+def apply_preset(args):
+    if args.preset == 'none':
+        return args
+
+    base_defaults = {
+        'split_strategy': 'perturbation',
+        'split_col': 'split',
+        'perturb_parse_mode': 'raw',
+        'batch_size': 512,
+        'epochs': 50,
+        'target_mode': 'delta',
+        'timesteps': 1000,
+        'sample_steps': 50,
+        'timestep_sampler': 'uniform',
+        'cond_dropout': 0.0,
+        'val_sample_batches': 5,
+        'early_stop_metric': 'composite',
+        'score_w_delta': 1.0,
+        'score_w_top20p': 0.2,
+        'score_w_top20mse': 0.02,
+        'lambda_topde': 0.0,
+        'lambda_delta_corr': 0.0,
+        'lambda_centroid': 0.0,
+        'topde_k': 50,
+        'control_match_mode': 'random',
+        'control_match_k': 32,
+        'control_match_scope': 'global',
+        'control_prototype_mode': 'topk_weighted',
+        'control_prototype_temp': 1.0,
+    }
+
+    preset_updates = {
+        'vnext': {
+            'split_strategy': 'custom',
+            'timestep_sampler': 'loss-second-moment',
+            'cond_dropout': 0.1,
+            'val_sample_batches': 0,
+            'control_match_mode': 'atac_knn',
+            'control_match_k': 16,
+            'control_match_scope': 'global',
+            'control_prototype_mode': 'topk_weighted',
+            'control_prototype_temp': 1.0,
+            'lambda_topde': 0.5,
+            'lambda_delta_corr': 0.2,
+            'lambda_centroid': 0.2,
+        },
+        'smoke': {
+            'split_strategy': 'custom',
+            'epochs': 3,
+            'timesteps': 200,
+            'sample_steps': 20,
+            'batch_size': 64,
+            'timestep_sampler': 'uniform',
+            'cond_dropout': 0.1,
+            'val_sample_batches': 0,
+            'control_match_mode': 'atac_knn',
+            'control_match_k': 8,
+            'control_match_scope': 'global',
+            'control_prototype_mode': 'topk_weighted',
+            'lambda_topde': 0.2,
+            'lambda_delta_corr': 0.1,
+            'lambda_centroid': 0.1,
+        },
+    }[args.preset]
+
+    cli_tokens = set(sys.argv[1:])
+
+    def _is_explicitly_set(arg_name: str) -> bool:
+        flag = f'--{arg_name}'
+        if flag in cli_tokens:
+            return True
+        prefix = f'{flag}='
+        return any(tok.startswith(prefix) for tok in cli_tokens)
+
+    for k, v in preset_updates.items():
+        if _is_explicitly_set(k):
+            continue
+        if hasattr(args, k) and getattr(args, k) == base_defaults.get(k, None):
+            setattr(args, k, v)
+
+    return args
 
 
 def safe_pearson(x, y):
@@ -173,26 +302,34 @@ def calculate_metrics(pred, target, ctrl, top_k=(10, 20, 50)):
 
 
 def train():
-    args = get_args()
+    args = apply_preset(get_args())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f">>> scERso Diffusion 启动 | device={device} | split={args.split_strategy}")
+    print_run_header(args, device)
 
     processor = DataProcessor(
         args.data_path,
         test_size=args.test_size,
         val_size=args.val_size,
         split_strategy=args.split_strategy,
+        split_col=args.split_col,
+        perturb_parse_mode=args.perturb_parse_mode,
+        task_mode=args.task_mode,
         atac_key=args.atac_key,
         atac_bank_path=args.atac_bank_path,
         background_key=args.background_key,
     )
-    n_genes, n_perts, n_cell_lines = processor.load_data()
+    n_genes, n_perts, _ = processor.load_data()
     train_loader, val_loader, test_loader = processor.prepare_loaders(
         batch_size=args.batch_size,
         rna_noise=0.0,
         atac_key=args.atac_key,
         atac_bank_path=args.atac_bank_path,
         background_key=args.background_key,
+        control_match_mode=args.control_match_mode,
+        control_match_k=args.control_match_k,
+        control_match_scope=args.control_match_scope,
+        control_prototype_mode=args.control_prototype_mode,
+        control_prototype_temp=args.control_prototype_temp,
     )
 
     pretrained_weights = None
@@ -205,19 +342,21 @@ def train():
     model = PerturbationDiffusionPredictor(
         n_genes=n_genes,
         n_perturbations=n_perts,
-        n_cell_lines=n_cell_lines,
         pretrained_weights=pretrained_weights,
         perturb_dim=args.perturb_dim,
-        cell_line_dim=args.cell_line_dim,
         hidden_dims=args.hidden_dims,
         dropout=args.dropout,
         timesteps=args.timesteps,
+        target_mode=args.target_mode,
         dose_dim=args.dose_dim,
         time_dim=args.time_dim,
         drug_dim=(processor.drug_embeddings.shape[1] if processor.drug_embeddings is not None else 0),
         use_atac=(processor.atac_features is not None),
         atac_dim=atac_dim,
         cond_dropout=args.cond_dropout,
+        n_perturb_genes=len(getattr(processor, 'perturb_gene_vocab', []) or []),
+        task_mode=args.task_mode,
+        n_conditions=getattr(processor, 'n_conditions', 0),
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -234,11 +373,14 @@ def train():
 
     os.makedirs(args.save_dir, exist_ok=True)
     best_score = -float('inf')
+    best_top20_p = -float('inf')
+    best_delta_p = -float('inf')
+    best_top20_mse = float('inf')
     early_stopper = EarlyStopping(patience=args.patience)
     start_epoch = 0
 
     if args.resume_path is not None:
-        print(f">>> 从断点恢复: {args.resume_path}")
+        print(f"↺ Resume from: {args.resume_path}")
         ckpt = torch.load(args.resume_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
@@ -249,36 +391,97 @@ def train():
         if 'ema_state_dict' in ckpt and ckpt['ema_state_dict'] is not None:
             ema.shadow = {k: v.to(device) for k, v in ckpt['ema_state_dict'].items()}
         best_score = ckpt.get('best_score', best_score)
+        best_top20_p = ckpt.get('best_top20_p', best_top20_p)
+        best_delta_p = ckpt.get('best_delta_p', best_delta_p)
+        best_top20_mse = ckpt.get('best_top20_mse', best_top20_mse)
         start_epoch = ckpt.get('epoch', -1) + 1
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
         optimizer.zero_grad()
         train_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        pbar = tqdm(train_loader, desc=f"E{epoch+1:03d}/{args.epochs:03d}", leave=False)
 
         for i, batch in enumerate(pbar):
             ctrl_rna = batch['rna_control'].to(device)
             target_rna = batch['rna_target'].to(device)
             perturb = batch['perturb'].to(device)
-            cell_line = batch['cell_line'].to(device)
+            perturb_gene_idx = batch['perturb_gene_idx'].to(device) if 'perturb_gene_idx' in batch else None
+            is_control = batch['is_control'].to(device) if 'is_control' in batch else None
+            condition_id = batch['condition_id'].to(device) if 'condition_id' in batch else None
+            source_flag = batch['source_flag'].to(device) if 'source_flag' in batch else None
             dose = batch['dose'].to(device) if 'dose' in batch else None
             atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
             drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
             t, weights = timestep_sampler.sample(ctrl_rna.shape[0], device)
 
             with torch.amp.autocast("cuda", enabled=(args.amp and device.type == "cuda")):
-                loss = model(
-                    ctrl_rna,
-                    perturb,
-                    cell_line,
-                    target_rna=target_rna,
-                    dose=dose,
-                    atac_feat=atac_feat,
-                    drug_feat=drug_feat,
-                    t=t,
-                    weights=weights,
-                )
+                use_aux = (args.lambda_topde > 0) or (args.lambda_delta_corr > 0) or (args.lambda_centroid > 0)
+                if use_aux:
+                    diff_loss, details = model(
+                        ctrl_rna,
+                        perturb,
+                        target_rna=target_rna,
+                        dose=dose,
+                        atac_feat=atac_feat,
+                        drug_feat=drug_feat,
+                        t=t,
+                        weights=weights,
+                        return_details=True,
+                        perturb_gene_idx=perturb_gene_idx,
+                        is_control=is_control,
+                        condition_id=condition_id,
+                        source_flag=source_flag,
+                    )
+                    pred_target = details['pred_target']
+                    true_target = details['target_target']
+                    delta_pred = pred_target - ctrl_rna
+                    delta_true = true_target - ctrl_rna
+
+                    aux_loss = torch.tensor(0.0, device=ctrl_rna.device)
+                    if args.lambda_topde > 0:
+                        k = min(args.topde_k, delta_true.shape[1])
+                        top_idx = torch.topk(delta_true.abs(), k=k, dim=1).indices
+                        top_pred = torch.gather(delta_pred, 1, top_idx)
+                        top_true = torch.gather(delta_true, 1, top_idx)
+                        aux_loss = aux_loss + args.lambda_topde * torch.mean((top_pred - top_true) ** 2)
+
+                    if args.lambda_delta_corr > 0:
+                        cos = torch.nn.functional.cosine_similarity(delta_pred, delta_true, dim=1)
+                        aux_loss = aux_loss + args.lambda_delta_corr * torch.mean(1.0 - cos)
+
+                    if args.lambda_centroid > 0:
+                        centroid_loss = torch.tensor(0.0, device=ctrl_rna.device)
+                        uniq = torch.unique(perturb)
+                        counted = 0
+                        for pid in uniq:
+                            mask = (perturb == pid)
+                            if mask.sum() < 2:
+                                continue
+                            dpm = delta_pred[mask].mean(dim=0)
+                            dtm = delta_true[mask].mean(dim=0)
+                            centroid_loss = centroid_loss + torch.mean((dpm - dtm) ** 2)
+                            counted += 1
+                        if counted > 0:
+                            centroid_loss = centroid_loss / counted
+                        aux_loss = aux_loss + args.lambda_centroid * centroid_loss
+
+                    loss = diff_loss + aux_loss
+                else:
+                    loss = model(
+                        ctrl_rna,
+                        perturb,
+                        target_rna=target_rna,
+                        dose=dose,
+                        atac_feat=atac_feat,
+                        drug_feat=drug_feat,
+                        t=t,
+                        weights=weights,
+                        perturb_gene_idx=perturb_gene_idx,
+                        is_control=is_control,
+                        condition_id=condition_id,
+                        source_flag=source_flag,
+                    )
 
             scaler.scale(loss / args.accum_steps).backward()
 
@@ -292,8 +495,8 @@ def train():
 
             train_loss += float(loss.item())
             timestep_sampler.update_with_losses(t, torch.full_like(t, float(loss.detach().item()), dtype=torch.float32))
-            if i % 100 == 0:
-                pbar.set_postfix({'diff_loss': f"{loss.item():.6f}"})
+            if i % 200 == 0:
+                pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
         if len(train_loader) % args.accum_steps != 0:
             scaler.unscale_(optimizer)
@@ -312,24 +515,43 @@ def train():
                 ctrl = batch['rna_control'].to(device)
                 target = batch['rna_target'].to(device)
                 perturb = batch['perturb'].to(device)
-                cell_line = batch['cell_line'].to(device)
+                perturb_gene_idx = batch['perturb_gene_idx'].to(device) if 'perturb_gene_idx' in batch else None
+                is_control = batch['is_control'].to(device) if 'is_control' in batch else None
+                condition_id = batch['condition_id'].to(device) if 'condition_id' in batch else None
+                source_flag = batch['source_flag'].to(device) if 'source_flag' in batch else None
                 dose = batch['dose'].to(device) if 'dose' in batch else None
                 atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
                 drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
                 t, weights = timestep_sampler.sample(ctrl.shape[0], device)
-                loss = model(ctrl, perturb, cell_line, target, dose=dose, atac_feat=atac_feat, drug_feat=drug_feat, t=t, weights=weights)
+                loss = model(
+                    ctrl,
+                    perturb,
+                    target,
+                    dose=dose,
+                    atac_feat=atac_feat,
+                    drug_feat=drug_feat,
+                    t=t,
+                    weights=weights,
+                    perturb_gene_idx=perturb_gene_idx,
+                    is_control=is_control,
+                    condition_id=condition_id,
+                    source_flag=source_flag,
+                )
                 val_loss += float(loss.item())
 
         val_metrics = []
         ema.apply_shadow(model)
         with torch.no_grad():
             for i, batch in enumerate(val_loader):
-                if i >= args.val_sample_batches:
+                if args.val_sample_batches > 0 and i >= args.val_sample_batches:
                     break
                 ctrl = batch['rna_control'].to(device)
                 target = batch['rna_target'].to(device)
                 perturb = batch['perturb'].to(device)
-                cell_line = batch['cell_line'].to(device)
+                perturb_gene_idx = batch['perturb_gene_idx'].to(device) if 'perturb_gene_idx' in batch else None
+                is_control = batch['is_control'].to(device) if 'is_control' in batch else None
+                condition_id = batch['condition_id'].to(device) if 'condition_id' in batch else None
+                source_flag = batch['source_flag'].to(device) if 'source_flag' in batch else None
                 dose = batch['dose'].to(device) if 'dose' in batch else None
                 atac_feat = batch['atac_feat'].to(device) if 'atac_feat' in batch else None
                 drug_feat = drug_embeddings[perturb] if drug_embeddings is not None else None
@@ -337,12 +559,15 @@ def train():
                 pred = model.predict_single(
                     rna_control=ctrl,
                     perturb=perturb,
-                    cell_line=cell_line,
                     dose=dose,
                     atac_feat=atac_feat,
                     drug_feat=drug_feat,
                     sample_steps=args.sample_steps,
                     guidance_scale=args.guidance_scale,
+                    perturb_gene_idx=perturb_gene_idx,
+                    is_control=is_control,
+                    condition_id=condition_id,
+                    source_flag=source_flag,
                 )
                 val_metrics.append(calculate_metrics(pred, target, ctrl))
         ema.restore(model)
@@ -350,40 +575,68 @@ def train():
         avg_val_loss = val_loss / max(len(val_loader), 1)
         final_m = {k: float(np.mean([m[k] for m in val_metrics])) for k in val_metrics[0].keys()} if val_metrics else {}
 
-        print(
-            f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
-            f"All Pearson: {final_m.get('all_pearson', 0.0):.4f} | "
-            f"Delta Pearson: {final_m.get('delta_pearson', 0.0):.4f} | "
-            f"Top20 MSE: {final_m.get('top20_mse', 0.0):.4f} | "
-            f"Top20 Pearson: {final_m.get('top20_pearson', 0.0):.4f}"
-        )
+        print_epoch_summary(epoch + 1, args.epochs, avg_train_loss, avg_val_loss, final_m)
 
         scheduler.step()
-        current_score = final_m.get('top20_pearson', 0.0)
+        top20_p = float(final_m.get('top20_pearson', 0.0))
+        delta_p = float(final_m.get('delta_pearson', 0.0))
+        top20_mse = float(final_m.get('top20_mse', 0.0))
+        composite_score = (
+            args.score_w_delta * delta_p
+            + args.score_w_top20p * top20_p
+            - args.score_w_top20mse * top20_mse
+        )
+
+        if args.early_stop_metric == 'delta_pearson':
+            current_score = delta_p
+        elif args.early_stop_metric == 'top20_pearson':
+            current_score = top20_p
+        else:
+            current_score = composite_score
 
         ckpt = {
             'model_state_dict': model.state_dict(),
             'args': args,
             'n_genes': n_genes,
             'n_perts': n_perts,
-            'n_cell_lines': n_cell_lines,
-            'cell_line_categories': processor.cell_line_categories,
             'perturb_categories': processor.perturb_categories,
-            'baselines': processor.cell_line_baselines,
-            'atac_baselines': processor.cell_line_atac_baselines,
+            'atac_dim': atac_dim,
+            'use_atac': bool(processor.atac_features is not None),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'scaler_state_dict': scaler.state_dict(),
             'ema_state_dict': ema.shadow,
             'best_score': best_score,
+            'best_top20_p': best_top20_p,
+            'best_delta_p': best_delta_p,
+            'best_top20_mse': best_top20_mse,
+            'composite_score': composite_score,
             'epoch': epoch,
         }
+
+        if top20_p > best_top20_p:
+            best_top20_p = top20_p
+            ckpt['best_top20_p'] = best_top20_p
+            torch.save(ckpt, os.path.join(args.save_dir, "best_model_top20p.pth"))
+            print(f"  ↳ New best top20_p: {best_top20_p:.4f}  saved=best_model_top20p.pth")
+
+        if delta_p > best_delta_p:
+            best_delta_p = delta_p
+            ckpt['best_delta_p'] = best_delta_p
+            torch.save(ckpt, os.path.join(args.save_dir, "best_model_delta.pth"))
+            print(f"  ↳ New best delta_p: {best_delta_p:.4f}  saved=best_model_delta.pth")
+
+        if top20_mse < best_top20_mse:
+            best_top20_mse = top20_mse
+            ckpt['best_top20_mse'] = best_top20_mse
+            torch.save(ckpt, os.path.join(args.save_dir, "best_model_mse.pth"))
+            print(f"  ↳ New best top20_mse: {best_top20_mse:.4f}  saved=best_model_mse.pth")
 
         if current_score > best_score:
             best_score = current_score
             ckpt['best_score'] = best_score
             torch.save(ckpt, os.path.join(args.save_dir, "best_model_diff.pth"))
-            print(f"*** 发现更优模型 (Top20 Pearson: {best_score:.4f}), 已保存")
+            print(f"  ↳ New best stop_metric({args.early_stop_metric})={best_score:.4f}  saved=best_model_diff.pth")
 
         torch.save(ckpt, os.path.join(args.save_dir, "latest.pth"))
         if args.save_every_epoch:
@@ -391,10 +644,10 @@ def train():
             rotate_epoch_checkpoints(args.save_dir, args.keep_last_n)
 
         if early_stopper(current_score):
-            print("!!! 早停触发")
+            print("  ↳ Early stopping triggered.")
             break
 
-    print("\n>>> 训练结束")
+    print(f"\n✓ Training finished. Artifacts in: {args.save_dir}")
 
 
 if __name__ == "__main__":
