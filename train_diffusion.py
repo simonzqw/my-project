@@ -117,6 +117,8 @@ def get_args():
     parser.add_argument('--data_path', type=str, required=True)
     parser.add_argument('--save_dir', type=str, default='./checkpoints_diff')
     parser.add_argument('--pretrained_emb', type=str, default=None)
+    parser.add_argument('--scgpt_gene_emb_path', type=str, default=None)
+    parser.add_argument('--gene_prior_scale', type=float, default=0.1)
     parser.add_argument('--preset', type=str, default='none', choices=['none', 'vnext', 'smoke'])
 
     parser.add_argument('--split_strategy', type=str, default='perturbation', choices=['random', 'perturbation', 'custom'])
@@ -304,6 +306,29 @@ def calculate_metrics(pred, target, ctrl, top_k=(10, 20, 50)):
     return {k: (float(np.mean(v)) if len(v) > 0 else 0.0) for k, v in out.items()}
 
 
+def load_output_gene_weights(path, n_genes):
+    if path is None:
+        return None
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"scGPT gene embedding file not found: {path}")
+
+    arr = np.load(path)
+    if arr.ndim != 2:
+        raise ValueError(f"scGPT gene embedding must be 2D, got shape={arr.shape}")
+
+    if arr.shape[0] != n_genes:
+        raise ValueError(
+            f"scGPT gene embedding row number must match n_genes: "
+            f"{arr.shape[0]} vs {n_genes}. "
+            f"你应该使用按 adata.var_names 对齐的 2000HVG embedding。"
+        )
+
+    print(f">>> Loaded output gene prior from: {path}")
+    print(f">>> output gene prior shape: {arr.shape}")
+    return torch.tensor(arr, dtype=torch.float32)
+
+
 def train():
     args = apply_preset(get_args())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -343,6 +368,7 @@ def train():
         if getattr(processor, "idx_to_perturb_gene", None):
             gene_loader = GeneEmbeddingLoader(args.pretrained_emb, processor.idx_to_perturb_gene)
             pretrained_gene_weights = gene_loader.load_weights()
+    output_gene_weights = load_output_gene_weights(args.scgpt_gene_emb_path, n_genes)
 
     atac_dim = processor.atac_dim if getattr(processor, 'atac_features', None) is not None else 0
 
@@ -351,6 +377,8 @@ def train():
         n_perturbations=n_perts,
         pretrained_weights=pretrained_weights,
         pretrained_gene_weights=pretrained_gene_weights,
+        output_gene_weights=output_gene_weights,
+        gene_prior_scale=args.gene_prior_scale,
         perturb_dim=args.perturb_dim,
         hidden_dims=args.hidden_dims,
         dropout=args.dropout,

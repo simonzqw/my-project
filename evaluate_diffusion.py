@@ -158,6 +158,26 @@ def calculate_metrics(pred, target, ctrl, top_k=(10, 20, 50)):
     return {k: (float(np.mean(v)) if len(v) > 0 else 0.0) for k, v in out.items()}
 
 
+def load_output_gene_weights(path, n_genes):
+    if path is None:
+        return None
+
+    if not os.path.exists(path):
+        return None
+
+    arr = np.load(path)
+    if arr.ndim != 2:
+        raise ValueError(f"scGPT gene embedding must be 2D, got shape={arr.shape}")
+
+    if arr.shape[0] != n_genes:
+        raise ValueError(
+            f"scGPT gene embedding row number must match n_genes: "
+            f"{arr.shape[0]} vs {n_genes}"
+        )
+
+    return torch.tensor(arr, dtype=torch.float32)
+
+
 def get_args():
     parser = argparse.ArgumentParser(description="Evaluate diffusion perturbation predictor")
     parser.add_argument('--data_path', type=str, required=True)
@@ -172,6 +192,8 @@ def get_args():
     parser.add_argument('--sample_steps', type=int, default=None)
     parser.add_argument('--guidance_scale', type=float, default=None)
     parser.add_argument('--target_mode', type=str, default=None, choices=['target', 'delta'])
+    parser.add_argument('--scgpt_gene_emb_path', type=str, default=None)
+    parser.add_argument('--gene_prior_scale', type=float, default=None)
     parser.add_argument('--use_ema', action='store_true')
     parser.add_argument('--output_json', type=str, default='diffusion_eval.json')
     parser.add_argument('--dropout_eps', type=float, default=1e-3)
@@ -192,13 +214,26 @@ def get_args():
 def load_model_from_checkpoint(checkpoint, n_genes, n_perts, processor, device, target_mode_override=None):
     ckpt_args = checkpoint.get('args', argparse.Namespace())
     pretrained_weights = None
+    pretrained_gene_weights = None
+    state_dict = checkpoint['model_state_dict']
+    output_gene_weights = None
+
+    scgpt_gene_emb_path = getattr(get_args_cache, 'scgpt_gene_emb_path', None)
+    if scgpt_gene_emb_path is None:
+        scgpt_gene_emb_path = getattr(ckpt_args, 'scgpt_gene_emb_path', None)
+    if scgpt_gene_emb_path:
+        output_gene_weights = load_output_gene_weights(scgpt_gene_emb_path, n_genes)
+    if output_gene_weights is None and 'output_gene_embedding' in state_dict:
+        output_gene_weights = state_dict['output_gene_embedding'].detach().cpu().float()
 
     # 尽量从 checkpoint 恢复语义 perturb embedding 模式
     if hasattr(ckpt_args, 'pretrained_emb') and ckpt_args.pretrained_emb:
         loader = GeneEmbeddingLoader(ckpt_args.pretrained_emb, processor.id_to_perturb)
         pretrained_weights = loader.load_weights()
+        if getattr(processor, "idx_to_perturb_gene", None):
+            gene_loader = GeneEmbeddingLoader(ckpt_args.pretrained_emb, processor.idx_to_perturb_gene)
+            pretrained_gene_weights = gene_loader.load_weights()
     else:
-        state_dict = checkpoint['model_state_dict']
         if 'perturb_embedding.weight' in state_dict:
             emb_weight = state_dict['perturb_embedding.weight']
             if emb_weight.shape[0] == n_perts:
@@ -210,6 +245,13 @@ def load_model_from_checkpoint(checkpoint, n_genes, n_perts, processor, device, 
         n_genes=n_genes,
         n_perturbations=n_perts,
         pretrained_weights=pretrained_weights,
+        pretrained_gene_weights=pretrained_gene_weights,
+        output_gene_weights=output_gene_weights,
+        gene_prior_scale=(
+            getattr(get_args_cache, 'gene_prior_scale', None)
+            if getattr(get_args_cache, 'gene_prior_scale', None) is not None
+            else getattr(ckpt_args, 'gene_prior_scale', 0.1)
+        ),
         perturb_dim=getattr(ckpt_args, 'perturb_dim', state_dict_dim(checkpoint, 'perturb_embedding.weight', default=200)),
         hidden_dims=getattr(ckpt_args, 'hidden_dims', [512, 512, 512]),
         dropout=getattr(ckpt_args, 'dropout', 0.1),

@@ -151,6 +151,8 @@ class PerturbationDiffusionPredictor(nn.Module):
         n_perturbations: int,
         pretrained_weights: Optional[torch.Tensor] = None,
         pretrained_gene_weights: Optional[torch.Tensor] = None,
+        output_gene_weights: Optional[torch.Tensor] = None,
+        gene_prior_scale: float = 0.1,
         perturb_dim: int = 200,
         hidden_dims: Sequence[int] = (512, 512, 512),
         dropout: float = 0.1,
@@ -311,6 +313,41 @@ class PerturbationDiffusionPredictor(nn.Module):
         )
 
         self.context_dim = perturb_dim * 2
+        self.use_output_gene_prior = output_gene_weights is not None
+        self.gene_prior_scale = float(gene_prior_scale)
+        if self.use_output_gene_prior:
+            if output_gene_weights.dim() != 2:
+                raise ValueError("output_gene_weights must be a 2D tensor: [n_genes, gene_emb_dim]")
+            if output_gene_weights.shape[0] != n_genes:
+                raise ValueError(
+                    f"output_gene_weights rows must match n_genes: "
+                    f"{output_gene_weights.shape[0]} vs {n_genes}"
+                )
+
+            gene_emb_dim = int(output_gene_weights.shape[1])
+            self.register_buffer(
+                "output_gene_embedding",
+                output_gene_weights.detach().float().clone(),
+            )
+            self.output_gene_proj = nn.Sequential(
+                nn.Linear(gene_emb_dim, hidden_dims[0]),
+                nn.LayerNorm(hidden_dims[0]),
+                nn.SiLU(),
+                nn.Linear(hidden_dims[0], hidden_dims[0]),
+                nn.LayerNorm(hidden_dims[0]),
+            )
+            self.context_gene_query = nn.Sequential(
+                nn.Linear(self.context_dim, hidden_dims[0]),
+                nn.LayerNorm(hidden_dims[0]),
+                nn.SiLU(),
+                nn.Linear(hidden_dims[0], hidden_dims[0]),
+            )
+            self.gene_prior_norm = nn.LayerNorm(n_genes)
+        else:
+            self.output_gene_embedding = None
+            self.output_gene_proj = None
+            self.context_gene_query = None
+            self.gene_prior_norm = None
         self.mean_delta_head = nn.Sequential(
             nn.Linear(self.context_dim, hidden_dims[0]),
             nn.LayerNorm(hidden_dims[0]),
@@ -424,6 +461,23 @@ class PerturbationDiffusionPredictor(nn.Module):
         gate = self.effect_gate(torch.cat([z_bg, z_pert], dim=1))
         z_eff = gate * composed + (1.0 - gate) * z_pert
         return z_eff
+
+    def output_gene_prior(self, context: torch.Tensor) -> torch.Tensor:
+        if not self.use_output_gene_prior:
+            return torch.zeros(
+                context.shape[0],
+                self.n_genes,
+                device=context.device,
+                dtype=context.dtype,
+            )
+
+        gene_emb = self.output_gene_embedding.to(device=context.device, dtype=context.dtype)
+        gene_feat = self.output_gene_proj(gene_emb)
+        query = self.context_gene_query(context)
+        prior = torch.matmul(query, gene_feat.t())
+        prior = prior / (gene_feat.shape[1] ** 0.5)
+        prior = self.gene_prior_norm(prior)
+        return self.gene_prior_scale * prior
 
     def encode_semantic_latent(
         self,
@@ -613,7 +667,7 @@ class PerturbationDiffusionPredictor(nn.Module):
         if self.target_mode == "delta":
             target_for_diffusion = target_rna - rna_control
 
-        mean_delta = self.mean_delta_head(context)
+        mean_delta = self.mean_delta_head(context) + self.output_gene_prior(context)
         if self.target_mode == "delta":
             residual_target = target_for_diffusion - mean_delta
         else:
@@ -745,7 +799,7 @@ class PerturbationDiffusionPredictor(nn.Module):
         )
 
         uncond_context = None
-        mean_delta = self.mean_delta_head(context)
+        mean_delta = self.mean_delta_head(context) + self.output_gene_prior(context)
         if guidance_scale != 1.0:
             uncond_context = self.encode_context(
                 rna_control=rna_control,
