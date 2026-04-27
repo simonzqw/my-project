@@ -20,6 +20,9 @@ class DataProcessor:
         test_size=0.1,
         val_size=0.1,
         split_strategy='random',
+        split_col: str = 'split',
+        perturb_parse_mode: str = 'raw',
+        task_mode: str = 'single_gene',
         atac_key: Optional[str] = None,
         atac_bank_path: Optional[str] = None,
         background_key: str = 'cell_context',
@@ -28,6 +31,11 @@ class DataProcessor:
         self.test_size = test_size
         self.val_size = val_size
         self.split_strategy = split_strategy
+        self.split_col = split_col
+        self.perturb_parse_mode = perturb_parse_mode
+        if task_mode not in {'single_gene', 'translation'}:
+            raise ValueError("task_mode must be 'single_gene' or 'translation'")
+        self.task_mode = task_mode
         self.atac_key = atac_key
         self.atac_bank_path = atac_bank_path
         self.background_key = background_key
@@ -35,8 +43,15 @@ class DataProcessor:
         self.adata = None
         self.perturb_map = None
         self.id_to_perturb = None
+        self.perturb_gene_vocab = None
+        self.perturb_gene_to_idx = None
+        self.idx_to_perturb_gene = None
+        self.pad_gene_token = "__PAD__"
         self.cell_line_map = None
         self.gene_to_idx = None
+        self.condition_map = None
+        self.condition_categories = None
+        self.n_conditions = 0
 
         self.atac_features = None
         self.atac_dim = 0
@@ -76,23 +91,81 @@ class DataProcessor:
             self.adata.obs['smiles'] = self.adata.obs['SMILES']
 
         self.adata.obs['perturbation'] = self.adata.obs['perturbation'].astype(str)
-        if self.adata.obs['perturbation'].str.contains('_').any():
-            print(">>> 检测到扰动名称包含下划线，尝试清洗以匹配 side information...")
+        if self.perturb_parse_mode == 'single_gene_suffix_clean':
+            print(">>> perturb_parse_mode=single_gene_suffix_clean: 仅清理后缀噪声 (如 +ctrl / +control)")
             self.adata.obs['perturbation'] = self.adata.obs['perturbation'].apply(
-                lambda x: x.split('_')[0] if x != 'control' and '_' in str(x) else x
+                lambda x: str(x).replace('+control', '').replace('+ctrl', '') if str(x) != 'control' else 'control'
             )
-            print(f">>> 清洗后的扰动类别示例: {self.adata.obs['perturbation'].unique()[:5]}")
+        elif self.perturb_parse_mode == 'double_gene_parse':
+            print(">>> perturb_parse_mode=double_gene_parse: 解析双扰动标签，避免塌缩成 'double'")
+
+            def _parse_double(x):
+                x = str(x)
+                if x == 'control':
+                    return x
+                if x.startswith('double_'):
+                    parts = [p for p in x.split('_')[1:] if p]
+                    if len(parts) >= 2:
+                        a, b = sorted(parts[:2])
+                        return f"double|{a}+{b}"
+                return x
+
+            self.adata.obs['perturbation'] = self.adata.obs['perturbation'].apply(_parse_double)
+        else:
+            print(">>> perturb_parse_mode=raw: 保留原始 perturbation 字符串，不做下划线截断清洗。")
 
         self.adata.obs['perturbation'] = self.adata.obs['perturbation'].astype('category')
         self.perturb_categories = self.adata.obs['perturbation'].cat.categories.tolist()
         self.perturb_map = {name: i for i, name in enumerate(self.perturb_categories)}
         self.id_to_perturb = {i: name for name, i in self.perturb_map.items()}
+        gene_set = {self.pad_gene_token}
+        for name in self.perturb_categories:
+            name = str(name)
+            if name != 'control':
+                gene_set.add(name)
+        self.perturb_gene_vocab = sorted(gene_set)
+        self.perturb_gene_to_idx = {g: i for i, g in enumerate(self.perturb_gene_vocab)}
+        self.idx_to_perturb_gene = {i: g for g, i in self.perturb_gene_to_idx.items()}
+        print(f">>> single-gene perturbation vocab size: {len(self.perturb_gene_vocab)} (含 PAD)")
+
+        pad_idx = self.perturb_gene_to_idx[self.pad_gene_token]
+        perturb_gene_idx, is_control = [], []
+        for name in self.adata.obs['perturbation'].astype(str).values:
+            if name == 'control':
+                perturb_gene_idx.append(pad_idx)
+                is_control.append(1)
+            else:
+                perturb_gene_idx.append(self.perturb_gene_to_idx[name])
+                is_control.append(0)
+        self.adata.obs['perturb_gene_idx'] = np.array(perturb_gene_idx, dtype=np.int64)
+        self.adata.obs['is_control'] = np.array(is_control, dtype=np.int64)
+        print(">>> 已写入 adata.obs: perturb_gene_idx / is_control")
+
+        if self.task_mode == 'translation':
+            cond_col = 'condition' if 'condition' in self.adata.obs else 'perturbation'
+            self.adata.obs[cond_col] = self.adata.obs[cond_col].astype('category')
+            self.condition_categories = self.adata.obs[cond_col].cat.categories.tolist()
+            self.condition_map = {name: i for i, name in enumerate(self.condition_categories)}
+            self.n_conditions = len(self.condition_categories)
+            self.adata.obs['condition_id'] = self.adata.obs[cond_col].cat.codes.astype(np.int64)
+            if 'orig_condition' in self.adata.obs:
+                self.adata.obs['source_flag'] = (
+                    self.adata.obs[cond_col].astype(str).values == self.adata.obs['orig_condition'].astype(str).values
+                ).astype(np.int64)
+            else:
+                self.adata.obs['source_flag'] = np.zeros(self.adata.n_obs, dtype=np.int64)
+            print(f">>> translation mode condition vocab size: {self.n_conditions} (col={cond_col})")
+        else:
+            self.adata.obs['condition_id'] = np.zeros(self.adata.n_obs, dtype=np.int64)
+            self.adata.obs['source_flag'] = np.zeros(self.adata.n_obs, dtype=np.int64)
+            self.n_conditions = 0
 
         cell_line_col = 'cell_line' if 'cell_line' in self.adata.obs else 'source_batch'
         self.cell_line_col = cell_line_col
         self.adata.obs[cell_line_col] = self.adata.obs[cell_line_col].astype('category')
         self.cell_line_categories = self.adata.obs[cell_line_col].cat.categories.tolist()
         self.cell_line_map = {name: i for i, name in enumerate(self.cell_line_categories)}
+
 
     def _prepare_drug_features(self):
         self.drug_embeddings = None
@@ -252,6 +325,26 @@ class DataProcessor:
         print(f">>> 数据加载完成: {self.adata.n_obs} 细胞, {self.adata.n_vars} 基因")
         return self.adata.n_vars, len(self.perturb_categories), len(self.cell_line_categories)
 
+    def encode_structured_perturbation_names(self, perturb_names):
+        if self.perturb_gene_to_idx is None:
+            raise ValueError("perturb_gene vocab 尚未初始化，请先调用 load_data()。")
+
+        p_gene_idx, p_is_control = [], []
+        pad_idx = self.perturb_gene_to_idx[self.pad_gene_token]
+        for p_name in perturb_names:
+            name = str(p_name)
+            if name == 'control':
+                p_gene_idx.append(pad_idx)
+                p_is_control.append(1.0)
+            else:
+                p_gene_idx.append(self.perturb_gene_to_idx[name])
+                p_is_control.append(0.0)
+
+        return {
+            'perturb_gene_idx': torch.tensor(p_gene_idx, dtype=torch.long),
+            'is_control': torch.tensor(p_is_control, dtype=torch.float32),
+        }
+
     def prepare_loaders(
         self,
         batch_size=2048,
@@ -261,7 +354,12 @@ class DataProcessor:
         num_workers=4,
         atac_key=None,
         atac_bank_path=None,
-        background_key='cell_context'
+        background_key='cell_context',
+        control_match_mode='random',
+        control_match_k=32,
+        control_match_scope='cell_line',
+        control_prototype_mode='single',
+        control_prototype_temp=1.0,
     ):
         if self.atac_features is None and (atac_key is not None or atac_bank_path is not None):
             self._prepare_atac_features(
@@ -272,6 +370,10 @@ class DataProcessor:
 
         X = self.adata.X
         perturb_ids = self.adata.obs['perturbation'].cat.codes.values
+        perturb_gene_idx_ids = self.adata.obs['perturb_gene_idx'].values.astype(np.int64)
+        is_control_ids = self.adata.obs['is_control'].values.astype(np.float32)
+        condition_id_ids = self.adata.obs['condition_id'].values.astype(np.int64)
+        source_flag_ids = self.adata.obs['source_flag'].values.astype(np.int64)
         cell_line_ids = self.adata.obs[self.cell_line_col].cat.codes.values
         control_id = self.perturb_map.get('control', None)
 
@@ -282,7 +384,18 @@ class DataProcessor:
 
         indices = np.arange(self.adata.n_obs)
 
-        if self.split_strategy == 'perturbation':
+        if self.split_strategy == 'custom':
+            if self.split_col not in self.adata.obs:
+                raise ValueError(f"adata.obs 缺少自定义划分列: {self.split_col}")
+            split_values = self.adata.obs[self.split_col].astype(str).values
+            train_idx = np.where(split_values == 'train')[0]
+            val_idx = np.where(split_values == 'val')[0]
+            test_idx = np.where(split_values == 'test')[0]
+            print(f">>> 采用自定义划分策略: obs['{self.split_col}']")
+            print(f">>> 划分结果: train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}")
+            if len(train_idx) == 0 or len(val_idx) == 0 or len(test_idx) == 0:
+                raise ValueError(f"自定义划分列 {self.split_col} 中 train/val/test 至少有一个为空。")
+        elif self.split_strategy == 'perturbation':
             print(">>> 采用按扰动基因划分策略 (Zero-shot 分层模式)...")
             real_perts = [p for p in self.perturb_categories if p != 'control']
             np.random.seed(42)
@@ -311,15 +424,29 @@ class DataProcessor:
             train_idx, temp = train_test_split(indices, test_size=(self.val_size + self.test_size), random_state=42)
             val_idx, test_idx = train_test_split(temp, test_size=0.5, random_state=42)
 
-        control_pool_coarse = {}
-        control_pool_fine = {}
+        def build_control_pools(ctrl_indices):
+            control_pool_coarse = {}
+            control_pool_fine = {} if batch_ids is not None else None
+            for gidx in ctrl_indices:
+                c_id = int(cell_line_ids[gidx])
+                control_pool_coarse.setdefault(c_id, []).append(int(gidx))
+                if batch_ids is not None:
+                    b_id = int(batch_ids[gidx])
+                    control_pool_fine.setdefault((c_id, b_id), []).append(int(gidx))
+            return control_pool_coarse, control_pool_fine
+
         all_ctrl_idx = np.where(perturb_ids == control_id)[0] if control_id is not None else np.array([], dtype=np.int64)
-        for gidx in all_ctrl_idx:
-            c_id = int(cell_line_ids[gidx])
-            control_pool_coarse.setdefault(c_id, []).append(int(gidx))
-            if batch_ids is not None:
-                b_id = int(batch_ids[gidx])
-                control_pool_fine.setdefault((c_id, b_id), []).append(int(gidx))
+        train_ctrl_idx = np.intersect1d(train_idx, all_ctrl_idx)
+        val_ctrl_idx = np.intersect1d(val_idx, all_ctrl_idx)
+        test_ctrl_idx = np.intersect1d(test_idx, all_ctrl_idx)
+
+        train_control_pool_coarse, train_control_pool_fine = build_control_pools(train_ctrl_idx)
+        val_control_pool_coarse, val_control_pool_fine = build_control_pools(val_ctrl_idx)
+        test_control_pool_coarse, test_control_pool_fine = build_control_pools(test_ctrl_idx)
+        # 对于 perturbation zero-shot，val/test 通常没有 control。
+        # 因此统一复用 train control 作为 reference control bank。
+        ref_control_pool_coarse = train_control_pool_coarse
+        ref_control_pool_fine = train_control_pool_fine if batch_ids is not None else None
 
         if len(all_ctrl_idx) == 0:
             raise ValueError("未找到 control 样本，无法构建 control pool。")
@@ -328,9 +455,14 @@ class DataProcessor:
             def __init__(
                 self,
                 full_rna,
+                full_atac,
                 sample_indices,
                 p_ids,
                 c_ids,
+                p_gene_idx,
+                p_is_control,
+                p_condition_id,
+                p_source_flag,
                 doses,
                 atac_feats,
                 control_id,
@@ -342,11 +474,21 @@ class DataProcessor:
                 scale_rate=0.0,
                 is_train=True,
                 seed=42,
+                control_match_mode='random',
+                control_match_k=32,
+                control_match_scope='cell_line',
+                control_prototype_mode='single',
+                control_prototype_temp=1.0,
             ):
                 self.full_rna = full_rna
+                self.full_atac = full_atac
                 self.sample_indices = sample_indices
                 self.p_ids = p_ids
                 self.c_ids = c_ids
+                self.p_gene_idx = p_gene_idx
+                self.p_is_control = p_is_control
+                self.p_condition_id = p_condition_id
+                self.p_source_flag = p_source_flag
                 self.doses = doses
                 self.atac_feats = atac_feats
                 self.control_id = control_id
@@ -358,20 +500,26 @@ class DataProcessor:
                 self.scale_rate = scale_rate
                 self.is_train = is_train
                 self.rng = np.random.RandomState(seed)
-                self.global_control_fallback = np.concatenate(
-                    [np.array(v, dtype=np.int64) for v in self.control_pool_coarse.values()]
-                )
+                self.control_match_mode = control_match_mode
+                self.control_match_k = max(int(control_match_k), 1)
+                self.control_match_scope = control_match_scope
+                self.control_prototype_mode = control_prototype_mode
+                self.control_prototype_temp = max(float(control_prototype_temp), 1e-6)
+                if len(self.control_pool_coarse) > 0:
+                    self.global_control_fallback = np.concatenate(
+                        [np.array(v, dtype=np.int64) for v in self.control_pool_coarse.values()]
+                    )
+                else:
+                    self.global_control_fallback = np.array([], dtype=np.int64)
                 self.fixed_ctrl_idx = []
 
                 if not self.is_train:
                     for i in range(len(self.p_ids)):
                         p_id = int(self.p_ids[i])
-                        c_id = int(self.c_ids[i])
                         if p_id == self.control_id:
                             self.fixed_ctrl_idx.append(None)
                             continue
-                        candidates = self._get_control_candidates(i, c_id)
-                        self.fixed_ctrl_idx.append(int(self.rng.choice(candidates)))
+                        self.fixed_ctrl_idx.append(None)
 
             def __len__(self):
                 return len(self.p_ids)
@@ -380,6 +528,10 @@ class DataProcessor:
                 target_rna = self._get_rna_from_global(self.sample_indices[idx])
                 c_id = int(self.c_ids[idx])
                 p_id = int(self.p_ids[idx])
+                perturb_gene_idx = int(self.p_gene_idx[idx])
+                is_control = float(self.p_is_control[idx])
+                condition_id = int(self.p_condition_id[idx])
+                source_flag = int(self.p_source_flag[idx])
 
                 dose_val = self.doses[idx] if self.doses is not None else torch.tensor(0.0)
                 atac_val = self.atac_feats[idx] if self.atac_feats is not None else None
@@ -387,12 +539,16 @@ class DataProcessor:
                 if p_id == self.control_id:
                     input_rna = target_rna.clone()
                 else:
-                    if self.is_train:
-                        candidates = self._get_control_candidates(idx, c_id)
-                        ctrl_gidx = int(self.rng.choice(candidates))
+                    if self.control_prototype_mode != 'single':
+                        input_rna = self._build_control_prototype(idx, c_id)
                     else:
-                        ctrl_gidx = self.fixed_ctrl_idx[idx]
-                    input_rna = self._get_rna_from_global(ctrl_gidx)
+                        if self.is_train:
+                            ctrl_gidx = self._sample_control_index(idx, c_id)
+                        else:
+                            if self.fixed_ctrl_idx[idx] is None:
+                                self.fixed_ctrl_idx[idx] = self._sample_control_index(idx, c_id)
+                            ctrl_gidx = self.fixed_ctrl_idx[idx]
+                        input_rna = self._get_rna_from_global(ctrl_gidx)
 
                 if self.is_train:
                     if self.rna_noise > 0:
@@ -405,6 +561,10 @@ class DataProcessor:
                     'rna_control': input_rna,
                     'rna_target': target_rna,
                     'perturb': torch.tensor(p_id, dtype=torch.long),
+                    'perturb_gene_idx': torch.tensor(perturb_gene_idx, dtype=torch.long),
+                    'is_control': torch.tensor(is_control, dtype=torch.float32),
+                    'condition_id': torch.tensor(condition_id, dtype=torch.long),
+                    'source_flag': torch.tensor(source_flag, dtype=torch.long),
                     'cell_line': torch.tensor(c_id, dtype=torch.long),
                     'dose': dose_val,
                 }
@@ -413,6 +573,10 @@ class DataProcessor:
                 return item
 
             def _get_control_candidates(self, local_idx, c_id):
+                if self.control_match_scope == 'global':
+                    if self.global_control_fallback.size == 0:
+                        raise ValueError("当前 split 内不存在可用 control 样本（global 模式）。")
+                    return self.global_control_fallback
                 if self.local_batch_ids is not None and self.control_pool_fine is not None:
                     b_id = int(self.local_batch_ids[local_idx])
                     key = (c_id, b_id)
@@ -420,7 +584,57 @@ class DataProcessor:
                         return self.control_pool_fine[key]
                 if c_id in self.control_pool_coarse and len(self.control_pool_coarse[c_id]) > 0:
                     return self.control_pool_coarse[c_id]
+                if self.global_control_fallback.size == 0:
+                    raise ValueError("当前 split 内不存在可用 control 样本，无法为非-control 样本匹配输入 control。")
                 return self.global_control_fallback
+
+            def _sample_control_index(self, local_idx, c_id):
+                ranked_candidates, ranked_dists = self._rank_control_candidates(local_idx, c_id)
+                if ranked_dists is None:
+                    return int(self.rng.choice(ranked_candidates))
+                k = min(self.control_match_k, len(ranked_candidates))
+                if self.is_train and k > 1:
+                    return int(self.rng.choice(ranked_candidates[:k]))
+                return int(ranked_candidates[0])
+
+            def _rank_control_candidates(self, local_idx, c_id):
+                candidates = self._get_control_candidates(local_idx, c_id)
+                candidates = np.asarray(candidates, dtype=np.int64)
+                if self.control_match_mode != 'atac_knn' or self.full_atac is None or len(candidates) <= 1:
+                    return candidates.tolist(), None
+
+                target_global_idx = int(self.sample_indices[local_idx])
+                target_atac = self.full_atac[target_global_idx]
+                if target_atac.dim() != 1:
+                    target_atac = target_atac.view(-1)
+                cand_idx_t = torch.as_tensor(candidates, dtype=torch.long)
+                cand_atac = self.full_atac[cand_idx_t]
+                dists = torch.sum((cand_atac - target_atac.unsqueeze(0)) ** 2, dim=1)
+                order = torch.argsort(dists, dim=0).cpu().numpy()
+                sorted_candidates = candidates[order].tolist()
+                sorted_dists = dists[order].detach().cpu()
+                return sorted_candidates, sorted_dists
+
+            def _build_control_prototype(self, local_idx, c_id):
+                ranked_candidates, ranked_dists = self._rank_control_candidates(local_idx, c_id)
+                if len(ranked_candidates) == 0:
+                    raise ValueError("未找到可用于构造 control prototype 的候选 control。")
+
+                k = min(self.control_match_k, len(ranked_candidates))
+                if ranked_dists is None and self.is_train and len(ranked_candidates) > k:
+                    picked = self.rng.choice(np.asarray(ranked_candidates), size=k, replace=False).tolist()
+                    picked_dists = None
+                else:
+                    picked = ranked_candidates[:k]
+                    picked_dists = ranked_dists[:k] if ranked_dists is not None else None
+
+                rnas = torch.stack([self._get_rna_from_global(int(gidx)) for gidx in picked], dim=0)
+                if self.control_prototype_mode == 'topk_mean' or picked_dists is None:
+                    return torch.mean(rnas, dim=0)
+
+                # topk_weighted
+                weights = torch.softmax(-picked_dists / self.control_prototype_temp, dim=0).to(rnas.dtype)
+                return torch.sum(weights.unsqueeze(1) * rnas, dim=0)
 
             def _get_rna_from_global(self, global_idx):
                 row = self.full_rna[global_idx]
@@ -442,48 +656,78 @@ class DataProcessor:
 
         train_ds = GenerativeDataset(
             full_rna=X,
+            full_atac=self.atac_features,
             sample_indices=train_idx,
             p_ids=perturb_ids[train_idx],
             c_ids=cell_line_ids[train_idx],
+            p_gene_idx=perturb_gene_idx_ids[train_idx],
+            p_is_control=is_control_ids[train_idx],
+            p_condition_id=condition_id_ids[train_idx],
+            p_source_flag=source_flag_ids[train_idx],
             doses=train_doses,
             atac_feats=train_atac,
             control_id=control_id,
-            control_pool_coarse=control_pool_coarse,
-            control_pool_fine=control_pool_fine if batch_ids is not None else None,
+            control_pool_coarse=train_control_pool_coarse,
+            control_pool_fine=train_control_pool_fine if batch_ids is not None else None,
             local_batch_ids=train_local_batch,
             rna_noise=rna_noise,
             gene_mask_rate=gene_mask_rate,
             scale_rate=scale_rate,
             is_train=True,
             seed=42,
+            control_match_mode=control_match_mode,
+            control_match_k=control_match_k,
+            control_match_scope=control_match_scope,
+            control_prototype_mode=control_prototype_mode,
+            control_prototype_temp=control_prototype_temp,
         )
         val_ds = GenerativeDataset(
             full_rna=X,
+            full_atac=self.atac_features,
             sample_indices=val_idx,
             p_ids=perturb_ids[val_idx],
             c_ids=cell_line_ids[val_idx],
+            p_gene_idx=perturb_gene_idx_ids[val_idx],
+            p_is_control=is_control_ids[val_idx],
+            p_condition_id=condition_id_ids[val_idx],
+            p_source_flag=source_flag_ids[val_idx],
             doses=val_doses,
             atac_feats=val_atac,
             control_id=control_id,
-            control_pool_coarse=control_pool_coarse,
-            control_pool_fine=control_pool_fine if batch_ids is not None else None,
+            control_pool_coarse=ref_control_pool_coarse,
+            control_pool_fine=ref_control_pool_fine,
             local_batch_ids=val_local_batch,
             is_train=False,
             seed=42,
+            control_match_mode=control_match_mode,
+            control_match_k=control_match_k,
+            control_match_scope=control_match_scope,
+            control_prototype_mode=control_prototype_mode,
+            control_prototype_temp=control_prototype_temp,
         )
         test_ds = GenerativeDataset(
             full_rna=X,
+            full_atac=self.atac_features,
             sample_indices=test_idx,
             p_ids=perturb_ids[test_idx],
             c_ids=cell_line_ids[test_idx],
+            p_gene_idx=perturb_gene_idx_ids[test_idx],
+            p_is_control=is_control_ids[test_idx],
+            p_condition_id=condition_id_ids[test_idx],
+            p_source_flag=source_flag_ids[test_idx],
             doses=test_doses,
             atac_feats=test_atac,
             control_id=control_id,
-            control_pool_coarse=control_pool_coarse,
-            control_pool_fine=control_pool_fine if batch_ids is not None else None,
+            control_pool_coarse=ref_control_pool_coarse,
+            control_pool_fine=ref_control_pool_fine,
             local_batch_ids=test_local_batch,
             is_train=False,
             seed=42,
+            control_match_mode=control_match_mode,
+            control_match_k=control_match_k,
+            control_match_scope=control_match_scope,
+            control_prototype_mode=control_prototype_mode,
+            control_prototype_temp=control_prototype_temp,
         )
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
