@@ -150,6 +150,7 @@ class PerturbationDiffusionPredictor(nn.Module):
         n_genes: int,
         n_perturbations: int,
         pretrained_weights: Optional[torch.Tensor] = None,
+        pretrained_gene_weights: Optional[torch.Tensor] = None,
         perturb_dim: int = 200,
         hidden_dims: Sequence[int] = (512, 512, 512),
         dropout: float = 0.1,
@@ -192,7 +193,15 @@ class PerturbationDiffusionPredictor(nn.Module):
 
         self.perturb_gene_embedding = None
         if self.n_perturb_genes > 0:
-            self.perturb_gene_embedding = nn.Embedding(self.n_perturb_genes, perturb_dim)
+            if pretrained_gene_weights is not None:
+                self.perturb_gene_embedding = nn.Embedding.from_pretrained(
+                    pretrained_gene_weights,
+                    freeze=False,
+                )
+                perturb_dim = int(pretrained_gene_weights.shape[1])
+                self.perturb_dim = perturb_dim
+            else:
+                self.perturb_gene_embedding = nn.Embedding(self.n_perturb_genes, perturb_dim)
         self.control_flag_embedding = nn.Embedding(2, perturb_dim)
         self.condition_embedding = None
         if self.task_mode == "translation" and self.n_conditions > 0:
@@ -302,6 +311,17 @@ class PerturbationDiffusionPredictor(nn.Module):
         )
 
         self.context_dim = perturb_dim * 2
+        self.mean_delta_head = nn.Sequential(
+            nn.Linear(self.context_dim, hidden_dims[0]),
+            nn.LayerNorm(hidden_dims[0]),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dims[0], hidden_dims[0]),
+            nn.LayerNorm(hidden_dims[0]),
+            nn.SiLU(),
+            nn.Linear(hidden_dims[0], n_genes),
+        )
+        self.residual_sample_scale = 0.0
         self.denoise_fn = SquidiffStyleDecoder(
             input_dim=n_genes,
             bg_dim=perturb_dim,
@@ -590,25 +610,40 @@ class PerturbationDiffusionPredictor(nn.Module):
         if self.target_mode == "delta":
             target_for_diffusion = target_rna - rna_control
 
+        mean_delta = self.mean_delta_head(context)
+        if self.target_mode == "delta":
+            residual_target = target_for_diffusion - mean_delta
+        else:
+            residual_target = target_for_diffusion - mean_delta
+
         if t is None:
             t = torch.randint(0, self.diffusion.timesteps, (target_rna.shape[0],), device=target_rna.device).long()
         diff_out = self.diffusion.p_losses(
-            x_start=target_for_diffusion,
+            x_start=residual_target,
             t=t,
             context=context,
             weights=weights,
             return_details=return_details,
         )
+        mean_loss = torch.mean((mean_delta - target_for_diffusion) ** 2)
         if return_details:
-            loss, details = diff_out
+            diff_loss, details = diff_out
+            residual_pred = details["pred_x0"]
+            pred_x0 = mean_delta + residual_pred
+            loss = diff_loss + 1.0 * mean_loss
             if self.target_mode == "delta":
-                details['pred_target'] = details['pred_x0'] + rna_control
-                details['target_target'] = target_rna
+                details["pred_target"] = pred_x0 + rna_control
+                details["target_target"] = target_rna
+                details["pred_delta"] = pred_x0
+                details["target_delta"] = target_for_diffusion
             else:
-                details['pred_target'] = details['pred_x0']
-                details['target_target'] = target_rna
+                details["pred_target"] = pred_x0
+                details["target_target"] = target_rna
+            details["mean_delta"] = mean_delta
+            details["residual_pred"] = residual_pred
             return loss, details
-        return diff_out
+        diff_loss = diff_out
+        return diff_loss + 1.0 * mean_loss
 
     @torch.no_grad()
     def predict_single(
@@ -702,6 +737,7 @@ class PerturbationDiffusionPredictor(nn.Module):
         )
 
         uncond_context = None
+        mean_delta = self.mean_delta_head(context)
         if guidance_scale != 1.0:
             uncond_context = self.encode_context(
                 rna_control=rna_control,
@@ -717,12 +753,14 @@ class PerturbationDiffusionPredictor(nn.Module):
                 source_flag=source_flag,
             )
 
-        generated_rna = self.diffusion.sample(
+        residual = self.diffusion.sample(
             context=context,
             sampling_timesteps=sample_steps,
             guidance_scale=guidance_scale,
             uncond_context=uncond_context,
         )
         if self.target_mode == "delta":
-            generated_rna = rna_control + generated_rna
+            generated_rna = rna_control + mean_delta + self.residual_sample_scale * residual
+        else:
+            generated_rna = mean_delta + self.residual_sample_scale * residual
         return generated_rna

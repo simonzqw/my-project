@@ -333,9 +333,13 @@ def train():
     )
 
     pretrained_weights = None
+    pretrained_gene_weights = None
     if args.pretrained_emb:
         loader = GeneEmbeddingLoader(args.pretrained_emb, processor.id_to_perturb)
         pretrained_weights = loader.load_weights()
+        if getattr(processor, "idx_to_perturb_gene", None):
+            gene_loader = GeneEmbeddingLoader(args.pretrained_emb, processor.idx_to_perturb_gene)
+            pretrained_gene_weights = gene_loader.load_weights()
 
     atac_dim = processor.atac_dim if getattr(processor, 'atac_features', None) is not None else 0
 
@@ -343,6 +347,7 @@ def train():
         n_genes=n_genes,
         n_perturbations=n_perts,
         pretrained_weights=pretrained_weights,
+        pretrained_gene_weights=pretrained_gene_weights,
         perturb_dim=args.perturb_dim,
         hidden_dims=args.hidden_dims,
         dropout=args.dropout,
