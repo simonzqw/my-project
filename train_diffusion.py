@@ -158,6 +158,9 @@ def get_args():
     parser.add_argument('--lambda_delta_corr', type=float, default=0.0)
     parser.add_argument('--lambda_centroid', type=float, default=0.0)
     parser.add_argument('--topde_k', type=int, default=50)
+    parser.add_argument('--mean_loss_weight', type=float, default=10.0)
+    parser.add_argument('--diff_loss_weight', type=float, default=0.1)
+    parser.add_argument('--mean_only', action='store_true')
 
     parser.add_argument('--atac_key', type=str, default=None)
     parser.add_argument('--atac_bank_path', type=str, default=None)
@@ -437,6 +440,9 @@ def train():
                         is_control=is_control,
                         condition_id=condition_id,
                         source_flag=source_flag,
+                        mean_loss_weight=args.mean_loss_weight,
+                        diff_loss_weight=args.diff_loss_weight,
+                        mean_only=args.mean_only,
                     )
                     pred_target = details['pred_target']
                     true_target = details['target_target']
@@ -486,6 +492,9 @@ def train():
                         is_control=is_control,
                         condition_id=condition_id,
                         source_flag=source_flag,
+                        mean_loss_weight=args.mean_loss_weight,
+                        diff_loss_weight=args.diff_loss_weight,
+                        mean_only=args.mean_only,
                     )
 
             scaler.scale(loss / args.accum_steps).backward()
@@ -541,6 +550,9 @@ def train():
                     is_control=is_control,
                     condition_id=condition_id,
                     source_flag=source_flag,
+                    mean_loss_weight=args.mean_loss_weight,
+                    diff_loss_weight=args.diff_loss_weight,
+                    mean_only=args.mean_only,
                 )
                 val_loss += float(loss.item())
 

@@ -590,6 +590,9 @@ class PerturbationDiffusionPredictor(nn.Module):
         is_control: Optional[torch.Tensor] = None,
         condition_id: Optional[torch.Tensor] = None,
         source_flag: Optional[torch.Tensor] = None,
+        mean_loss_weight: float = 10.0,
+        diff_loss_weight: float = 0.1,
+        mean_only: bool = False,
     ) -> Optional[torch.Tensor]:
         context = self.encode_context(
             rna_control=rna_control,
@@ -630,7 +633,10 @@ class PerturbationDiffusionPredictor(nn.Module):
             diff_loss, details = diff_out
             residual_pred = details["pred_x0"]
             pred_x0 = mean_delta + residual_pred
-            loss = diff_loss + 1.0 * mean_loss
+            if mean_only:
+                loss = mean_loss
+            else:
+                loss = diff_loss_weight * diff_loss + mean_loss_weight * mean_loss
             if self.target_mode == "delta":
                 details["pred_target"] = pred_x0 + rna_control
                 details["target_target"] = target_rna
@@ -643,7 +649,9 @@ class PerturbationDiffusionPredictor(nn.Module):
             details["residual_pred"] = residual_pred
             return loss, details
         diff_loss = diff_out
-        return diff_loss + 1.0 * mean_loss
+        if mean_only:
+            return mean_loss
+        return diff_loss_weight * diff_loss + mean_loss_weight * mean_loss
 
     @torch.no_grad()
     def predict_single(
