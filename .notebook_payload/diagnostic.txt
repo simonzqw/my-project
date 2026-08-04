@@ -1,0 +1,14 @@
+Payload sizes
+19999 .notebook_payload/part00.b64
+19999 .notebook_payload/part01.b64
+19999 .notebook_payload/part02.b64
+19999 .notebook_payload/part03.b64
+19999 .notebook_payload/part04.b64
+99995 total
+
+Payload SHA256
+e99f3b6c1ada228ea9a8409272fe0a0724cd71b67f5d24bb7e33f42a3037b030  .notebook_payload/part00.b64
+12f743d39d1bf60796351bf4a3e1e1f8fe7d255e2284f27faceef3e4db6952b3  .notebook_payload/part01.b64
+1c16685c8fbd7bb565950ccd25cbeed50de974fcf6db100aedff70dd393d6830  .notebook_payload/part02.b64
+878aef9d1c880c5cf392bdc75732fde2e404935c411f962f920bbd577f78150f  .notebook_payload/part03.b64
+24aadb2c86db74804cdd6181588c07b2e33bc8819a7ef12e6a2d652a1da130f2  .notebook_payload/part04.b64

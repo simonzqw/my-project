@@ -1,0 +1,46 @@
+name: Inspect notebook payload
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: write
+
+jobs:
+  inspect-payload:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Write payload diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "Payload sizes"
+            wc -c .notebook_payload/part*.b64
+            echo
+            echo "Payload SHA256"
+            sha256sum .notebook_payload/part*.b64
+          } > .notebook_payload/diagnostic.txt
+
+      - name: Commit diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .notebook_payload/diagnostic.txt
+          git commit -m "Record notebook payload diagnostics"
+          git push origin "HEAD:${{ github.head_ref }}"
